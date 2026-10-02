@@ -1,0 +1,41 @@
+name: vk-platform
+label: VK
+kind: platform
+version: 1.0.0
+description: >
+  VK (ВКонтакте) gateway adapter for Hermes Agent.
+  Connects Hermes to a VK community bot through the Bots Long Poll API —
+  no public URL, no domain, no webhook. Works from RF networks without a proxy.
+  Ported from the openclaw-vk channel plugin.
+author: Hermes Agent
+requires_env:
+  - name: VK_TOKEN
+    description: "Ключ доступа сообщества (VK community access token) с правами «Сообщения сообщества» и «Управление сообществом»"
+    prompt: "VK community token"
+    url: "https://dev.vk.com/ru/api/bots/getting-started"
+    password: true
+optional_env:
+  - name: VK_HOME_CHANNEL
+    description: "VK id (peer id) для доставки cron-отчётов, например 1234567"
+    prompt: "Home peer id"
+    password: false
+  - name: VK_ALLOWED_USERS
+    description: "VK id пользователей, которым разрешено писать боту (через запятую)"
+    prompt: "Allowed VK ids (comma-separated)"
+    password: false
+  - name: VK_ALLOW_ALL_USERS
+    description: "Разрешить писать боту любому пользователю VK (только для тестов)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: VK_GROUP_ID
+    description: "ID сообщества (определяется автоматически из токена; укажите только если токен общий)"
+    prompt: "Community id (optional)"
+    password: false
+  - name: VK_QUOTE_IN_GROUPS
+    description: "Цитировать входящее сообщение при ответе в беседе (по умолчанию true)"
+    prompt: "Quote in group chats? (true/false)"
+    password: false
+  - name: VK_API_VERSION
+    description: "Версия VK API (по умолчанию 5.199)"
+    prompt: "API version"
+    password: false

@@ -1,0 +1,27 @@
+hermes-vk
+Copyright 2026 TemArt90
+
+This product is a VK (ВКонтакте) messaging channel plugin for Hermes Agent.
+It is an independent Python implementation written against the Hermes platform-plugin
+contract (Bots Long Poll API inbound, messages.send outbound).
+
+It was written after studying the openclaw-vk channel plugin, whose transport flow,
+message shapes and keyboard payloads served as the reference:
+
+    openclaw-vk — https://github.com/pfrankov/openclaw-vk
+    Copyright 2026 Pavel Frankov
+    Licensed under the Apache License, Version 2.0 (their LICENSE carries that notice).
+
+The Apache-2.0 text in this repository's LICENSE differs from theirs in one line only:
+the copyright owner in the appendix, which applies the license to this work.
+
+No source code from openclaw-vk (TypeScript/Node) is included or linked here; the
+implementation, the markdown→format_data renderer, the media pipeline and the tests are
+original work for the Python/Hermes runtime. Changes relative to the reference design:
+a full re-implementation rather than a port of files — the long-poll loop, the
+table/quote-aware markdown renderer, VK's per-item format_data allowlist, the upload
+pipeline (photos/docs/audio_message) and the shared Hermes button convention
+(clarify / exec-approval / slash-confirm) all follow Hermes' plugin contract.
+
+This product includes software developed at
+The Apache Software Foundation (http://www.apache.org/).
