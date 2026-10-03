@@ -13,13 +13,11 @@ import asyncio
 import contextlib
 import json
 import os
-import pathlib
 import sys
 import traceback
 from types import SimpleNamespace
 
-# plugin parent, so `from vk.…` works when this file is run standalone (pytest.ini adds it too)
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+import _paths  # noqa: E402  (registers the plugin as `vk`, whatever this directory is called)
 
 from vk.adapter import VKAdapter, _is_group, _keyboard  # noqa: E402
 from vk.vk_markdown import VK_SAFE_ITEM_TYPES, render_chunks, to_plain, u16_len  # noqa: E402

@@ -12,13 +12,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import pathlib
 import sys
 import traceback
 from typing import Any, Dict, List
 
-# plugin parent, so `from vk.…` works when this file is run standalone (pytest.ini adds it too)
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+import _paths  # noqa: E402  (registers the plugin as `vk`, whatever this directory is called)
 
 from aiohttp import web  # noqa: E402
 
