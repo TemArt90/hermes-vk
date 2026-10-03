@@ -236,6 +236,12 @@ class FakeClient:
         self.conversations: list = []
         self.conversations_calls = 0
         self.video_uploads: list = []
+        self.video_lookups: list = []
+
+    async def get_video_file(self, video, **kwargs):
+        self.video_lookups.append(dict(video))
+        return {"url": "https://cdn.example/v.mp4", "title": video.get("title") or "video",
+                "duration": int(video.get("duration") or 0), "ext": ".mp4"}
 
     async def upload_video(self, data, filename, **kwargs):
         self.video_uploads.append((filename, len(data)))
@@ -1673,25 +1679,31 @@ def test_video_falls_back_to_a_document_when_vk_refuses_the_video_path():
 
 def test_client_video_upload_reserves_uploads_and_returns_the_attachment():
     """Three steps in one call: ``video.save`` reserves, the bytes go to the returned URL, and the
-    reserved id becomes the attachment. A wrong order — or a skipped upload — yields a broken string."""
+    reserved id becomes the attachment. A wrong order — or a skipped upload — yields a broken string.
+
+    Note the stub point: ``upload_video`` goes through ``call_as`` (it must be able to use the optional
+    user token), so stubbing ``call`` is not enough — measured the hard way when these two tests started
+    reaching the real API after the refactor.
+    """
     from vk.vk_api import VkClient
     client = VkClient("vk1.a.MOCK")
     calls: list = []
     uploads: list = []
 
-    async def _call(method, **params):
-        calls.append((method, params))
+    async def _call_as(token, method, **params):
+        calls.append((token, method, params))
         return {"upload_url": "https://up.example/v", "video_id": 5, "owner_id": -777}
 
     async def _upload(url, data, filename):
         uploads.append((url, filename, len(data)))
         return {}
 
-    client.call, client._upload = _call, _upload
+    client.call_as, client._upload = _call_as, _upload
     with open_loop() as loop:
         attachment = loop.run_until_complete(client.upload_video(b"f" * 10, "клип.mp4"))
     assert attachment == "video-777_5"
-    assert calls == [("video.save", {"name": "клип.mp4", "is_private": 1, "wallpost": 0, "timeout": 30})]
+    assert calls == [("vk1.a.MOCK", "video.save",
+                      {"name": "клип.mp4", "is_private": 1, "wallpost": 0, "timeout": 30})]
     assert uploads == [("https://up.example/v", "клип.mp4", 10)]
 
 
@@ -1701,10 +1713,10 @@ def test_client_video_upload_fails_loudly_without_an_upload_url():
     from vk.vk_api import VkApiError, VkClient
     client = VkClient("vk1.a.MOCK")
 
-    async def _call(method, **params):
+    async def _call_as(token, method, **params):
         return {"video_id": 0}
 
-    client.call = _call
+    client.call_as = _call_as
     caught = None
     with open_loop() as loop:
         try:
@@ -1809,6 +1821,168 @@ def test_adapter_construction_does_not_write_credentials_into_the_environment(mo
     make_adapter()
     make_adapter()
     assert {name: value for name, value in os.environ.items() if name.startswith("VK_")} == before
+
+
+# ── входящее видео через пользовательский токен ──────────────────────────────
+
+def test_video_lookup_uses_the_user_token_not_the_community_one():
+    """`video.get` is a user-scope method — the community key gets error 5 (measured live), so which
+    token travels here is the whole point of the feature."""
+    from vk.vk_api import VkClient
+    client = VkClient("community-token", user_token="user-token")
+    seen: list = []
+
+    async def _call_as(token, method, **params):
+        seen.append((token, method, params))
+        return {"items": [{"files": {"mp4_720": "https://cdn.example/x.mp4"}, "title": "клип",
+                           "duration": 12}]}
+
+    client.call_as = _call_as
+    with open_loop() as loop:
+        best = loop.run_until_complete(client.get_video_file({"owner_id": -1, "id": 7, "access_key": "ak"}))
+    assert best == {"url": "https://cdn.example/x.mp4", "title": "клип", "duration": 12, "ext": ".mp4"}
+    assert seen == [("user-token", "video.get", {"videos": "-1_7_ak", "timeout": 30})]
+
+
+def test_video_lookup_is_not_attempted_without_a_user_token():
+    """No user token means do not even ask: a community-key call would fail and log noise every time."""
+    from vk.vk_api import VkClient
+    client = VkClient("community-token")
+    calls: list = []
+
+    async def _fail(*args, **kwargs):
+        calls.append(args)
+        raise AssertionError("video.get must not be attempted without a user token")
+
+    client.call_as = _fail
+    with open_loop() as loop:
+        assert loop.run_until_complete(client.get_video_file({"owner_id": -1, "id": 7})) is None
+    assert calls == []
+
+
+def test_video_lookup_prefers_the_largest_available_mp4():
+    from vk.vk_api import VkClient
+    client = VkClient("c", user_token="u")
+
+    async def _call_as(token, method, **params):
+        return {"items": [{"files": {"mp4_240": "low", "mp4_720": "high"}}]}
+
+    client.call_as = _call_as
+    with open_loop() as loop:
+        best = loop.run_until_complete(client.get_video_file({"owner_id": 1, "id": 2}))
+    assert best["url"] == "high"
+
+
+def test_video_exposing_only_a_watch_page_is_not_an_error():
+    """Some videos have no `files` block at all: nothing to download, so the caller keeps its note."""
+    from vk.vk_api import VkClient
+    client = VkClient("c", user_token="u")
+
+    async def _call_as(token, method, **params):
+        return {"items": [{"id": 2, "title": "стрим"}]}
+
+    client.call_as = _call_as
+    with open_loop() as loop:
+        assert loop.run_until_complete(client.get_video_file({"owner_id": 1, "id": 2})) is None
+
+
+def test_video_upload_prefers_the_user_token():
+    """`video.save` is user-scope too: with a user token the native path becomes possible instead of
+    always falling back to a document."""
+    from vk.vk_api import VkClient
+    client = VkClient("community-token", user_token="user-token")
+    seen: list = []
+
+    async def _call_as(token, method, **params):
+        seen.append((token, method))
+        return {"upload_url": "https://up.example/v", "video_id": 5, "owner_id": -777}
+
+    async def _upload(url, data, filename):
+        return {}
+
+    client.call_as, client._upload = _call_as, _upload
+    with open_loop() as loop:
+        loop.run_until_complete(client.upload_video(b"f" * 10, "клип.mp4"))
+    assert seen == [("user-token", "video.save")]
+
+
+def test_redaction_strips_a_token_and_an_access_token_parameter():
+    """The user token is a person's credential: an error string quoting a URL must not carry it into
+    errors.log, a chat message, or the agent transcript."""
+    from vk.vk_api import redact_secrets
+    text = redact_secrets("boom vk1.a.SECRETTOKEN https://x/y?access_token=abc123&v=5.199", "vk1.a.SECRETTOKEN")
+    assert "SECRETTOKEN" not in text and "abc123" not in text
+    assert text.count("[REDACTED]") == 2
+
+
+def test_inbound_video_is_downloaded_for_the_agent_when_a_user_token_is_set():
+    adapter = make_adapter({"user_token": "user-token"})
+    adapter.client = RecordingClient(payload=b"\x00\x00\x00\x18ftypmp42" + b"0" * 32)
+    seen = capture_events(adapter)
+    run_inbound(adapter, {**GROUP_MSG, "attachments": [
+        {"type": "video", "video": {"id": 7, "owner_id": -1, "title": "скринкаст", "duration": 42}}]}, "v1")
+    assert adapter.client.video_lookups == [{"id": 7, "owner_id": -1, "title": "скринкаст", "duration": 42}]
+    assert len(seen[0].media_urls) == 1 and seen[0].media_types == ["video/mp4"]
+    assert "скринкаст" in seen[0].text and "42 с" in seen[0].text
+
+
+def test_inbound_video_stays_a_note_without_a_user_token():
+    """The default: the agent learns that a video arrived, and no API call is made."""
+    adapter = make_adapter()
+    adapter.client = RecordingClient()
+    seen = capture_events(adapter)
+    run_inbound(adapter, {**GROUP_MSG, "attachments": [
+        {"type": "video", "video": {"id": 7, "owner_id": -1, "title": "скринкаст", "duration": 42}}]}, "v2")
+    assert adapter.client.video_lookups == []
+    assert seen[0].media_urls == []
+    assert "[видео: скринкаст, 42 с]" in seen[0].text
+
+
+def test_inbound_video_is_not_fetched_when_downloads_are_switched_off():
+    """The download switch is checked before the API call, not after — otherwise a personal token would
+    be spent on files the operator explicitly asked not to receive."""
+    adapter = make_adapter({"user_token": "user-token", "download_attachments": False})
+    adapter.client = RecordingClient()
+    seen = capture_events(adapter)
+    run_inbound(adapter, {**GROUP_MSG, "attachments": [
+        {"type": "video", "video": {"id": 7, "owner_id": -1, "title": "скринкаст", "duration": 42}}]}, "v3")
+    assert adapter.client.video_lookups == [] and seen[0].media_urls == []
+
+
+def test_a_refused_video_lookup_never_costs_the_message():
+    """VK refusing (no video scope, deleted video, whatever) must leave the message intact with its note —
+    and the logged reason must be redacted."""
+    adapter = make_adapter({"user_token": "user-token"})
+    adapter.client = RecordingClient()
+
+    async def _refuse(video, **kwargs):
+        from vk.vk_api import VkApiError
+        raise VkApiError("video.get", 5, "User authorization failed: user-token was sent")
+
+    adapter.client.get_video_file = _refuse
+    seen = capture_events(adapter)
+    run_inbound(adapter, {**GROUP_MSG, "attachments": [
+        {"type": "video", "video": {"id": 7, "owner_id": -1, "title": "скринкаст", "duration": 42}}]}, "v4")
+    assert len(seen) == 1 and "[видео: скринкаст, 42 с]" in seen[0].text
+    assert seen[0].media_urls == []
+
+
+def test_user_token_is_read_from_config_and_environment(monkeypatch):
+    assert make_adapter().user_token == ""                      # по умолчанию — не задан
+    assert make_adapter({"user_token": "from-config"}).user_token == "from-config"
+    monkeypatch.setenv("VK_USER_TOKEN", "from-env")
+    assert make_adapter({"user_token": "from-config"}).user_token == "from-env"  # переменная важнее конфига
+
+
+def test_a_user_token_alone_does_not_make_the_platform_ready(monkeypatch):
+    """Fail-closed stays about the COMMUNITY token: a personal token without a community key is not a
+    working channel."""
+    import vk.adapter as mod
+    monkeypatch.setattr(mod, "get_scoped_secret",
+                        lambda name, default="": "user-token" if name == "VK_USER_TOKEN" else default)
+    assert mod.check_requirements() is False
+    assert mod._env_enablement() is None
+    assert make_adapter().token == "" and make_adapter().user_token == "user-token"
 
 
 class _MiniMonkeypatch:

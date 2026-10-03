@@ -53,6 +53,7 @@ _SCRIPT = textwrap.dedent(
             adapter = plugin.VKAdapter(PlatformConfig(extra={}))
             return {
                 "token": adapter.token,
+                "user_token": adapter.user_token,
                 "requirements": plugin.check_requirements(),
                 "enablement": plugin._env_enablement(),
             }
@@ -84,8 +85,9 @@ def _drive_profiles(tmp_path: pathlib.Path) -> dict:
     (tmp_path / "os-home").mkdir()
     default_home.mkdir()
     child_home.mkdir()
-    (default_home / ".env").write_text("VK_TOKEN=default-profile-token\nVK_HOME_CHANNEL=13580122\n",
-                                       encoding="utf-8")
+    (default_home / ".env").write_text(
+        "VK_TOKEN=default-profile-token\nVK_USER_TOKEN=default-profile-user-token\nVK_HOME_CHANNEL=13580122\n",
+        encoding="utf-8")
     (child_home / ".env").write_text("", encoding="utf-8")
 
     env = {name: value for name, value in os.environ.items() if not name.startswith("VK_")}
@@ -95,6 +97,7 @@ def _drive_profiles(tmp_path: pathlib.Path) -> dict:
         # Ambient credentials are the trap: every profile's process in a multiplexed gateway sees them,
         # and a plugin that read them would answer as the wrong community.
         VK_TOKEN="ambient-token-that-must-be-ignored",
+        VK_USER_TOKEN="ambient-user-token-that-must-be-ignored",
     )
     result = subprocess.run(
         [sys.executable, "-c", _SCRIPT, str(PLUGIN_DIR.parent), str(RUNTIME),
@@ -125,10 +128,12 @@ def test_a_tokenless_profile_stays_closed_and_borrows_nothing(tmp_path):
         raise AssertionError("unreachable: pytest.skip never returns")  # keeps linters honest
 
     assert snapshots["default"]["token"] == "default-profile-token"
+    assert snapshots["default"]["user_token"] == "default-profile-user-token"
     assert snapshots["default"]["requirements"] is True
     assert snapshots["default"]["enablement"] is not None
 
     assert snapshots["child"]["token"] == ""             # nothing borrowed from the neighbouring profile
+    assert snapshots["child"]["user_token"] == ""         # the personal token is profile-scoped too
     assert snapshots["child"]["requirements"] is False    # fail closed, not fall back
     assert snapshots["child"]["enablement"] is None       # and no cron home channel was seeded
 
@@ -145,6 +150,8 @@ if __name__ == "__main__":
             print(f"skip profile isolation ({exc})")
             raise SystemExit(0)
     assert observed["default"]["token"] == "default-profile-token"
-    assert observed["child"]["token"] == "" and observed["child"]["requirements"] is False
+    assert observed["child"]["token"] == "" and observed["child"]["user_token"] == ""
+    assert observed["child"]["requirements"] is False
     print("ok   profile isolation: 1/1 passed "
-          "(default resolves its own token, tokenless profile stays closed, ambient VK_TOKEN ignored)")
+          "(default resolves its own token and user token, tokenless profile stays closed, "
+          "ambient VK_* ignored)")

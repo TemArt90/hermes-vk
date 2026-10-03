@@ -50,12 +50,12 @@ from gateway.platforms._shared import (
 )
 from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult,
-    cache_audio_from_bytes, cache_document_from_bytes, cache_image_from_bytes,
+    cache_audio_from_bytes, cache_document_from_bytes, cache_image_from_bytes, cache_video_from_bytes,
 )
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.platforms.helpers import MessageDeduplicator, cancel_task, compile_mention_patterns
 
-from .vk_api import DEFAULT_API_VERSION, VkApiError, VkClient
+from .vk_api import DEFAULT_API_VERSION, VkApiError, VkClient, redact_secrets
 from .vk_markdown import render_chunks, to_plain
 
 logger = logging.getLogger(__name__)
@@ -301,6 +301,11 @@ class VKAdapter(BasePlatformAdapter):
         super().__init__(config=config, platform=Platform("vk"))
         extra = getattr(config, "extra", {}) or {}
         self.token = str(_env(extra, "VK_TOKEN", "token", "") or "").strip()
+        # Optional USER token — a person's own VK account. The community key cannot call video.get or
+        # video.save at all (measured live: error 5 "User authorization failed"), so inbound video and
+        # native video upload need this one. Off unless the operator provides it, and deliberately NOT
+        # seeded into `extra`: the community token is visible in status output, a personal one must not be.
+        self.user_token = str(_env(extra, "VK_USER_TOKEN", "user_token", "") or "").strip()
         self.api_version = str(_env(extra, "VK_API_VERSION", "api_version", DEFAULT_API_VERSION) or DEFAULT_API_VERSION)
         try:
             self.group_id = int(_env(extra, "VK_GROUP_ID", "group_id", 0) or 0)
@@ -383,7 +388,8 @@ class VKAdapter(BasePlatformAdapter):
             return False
         if not self._acquire_platform_lock("vk", self.token, "VK community token"):
             return False
-        self.client = VkClient(self.token, api_version=self.api_version, group_id=self.group_id)
+        self.client = VkClient(self.token, api_version=self.api_version, group_id=self.group_id,
+                               user_token=self.user_token)
         try:
             await self.client.resolve_group()
         except VkApiError as exc:
@@ -717,7 +723,26 @@ class VKAdapter(BasePlatformAdapter):
                 elif kind == "audio":
                     notes.append(f"[аудио: {body.get('artist', '')} — {body.get('title', '')}]")
                 elif kind == "video":
-                    notes.append(f"[видео: {body.get('title') or body.get('id')}]")
+                    title = body.get("title") or body.get("id")
+                    duration = int(body.get("duration") or 0)
+                    note = f"[видео: {title}{f', {duration} с' if duration else ''}]"
+                    # A community key cannot fetch video files at all (measured: video.get answers error
+                    # 5), so this needs the optional user token. Without it the note still tells the agent
+                    # that a video arrived. Gated before the API call, like every other download.
+                    if self.user_token and self.download_attachments and self.client is not None:
+                        try:
+                            best = await self.client.get_video_file(body)
+                            if best:
+                                data = await self._download_attachment(best["url"])
+                                if data is not None:
+                                    media_urls.append(cache_video_from_bytes(data, best.get("ext") or ".mp4"))
+                                    media_types.append("video/mp4")
+                        except VkApiError as exc:
+                            logger.info("VK: inbound video unavailable (%s): %s", exc.code,
+                                        redact_secrets(exc.message, self.user_token))
+                        except Exception as exc:  # a video must never cost the whole message
+                            logger.info("VK: inbound video failed: %s", exc)
+                    notes.append(note)
                 elif kind == "sticker":
                     notes.append("[стикер]")
                 elif kind == "wall":

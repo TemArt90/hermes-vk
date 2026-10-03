@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import secrets
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -81,14 +82,50 @@ def random_id() -> int:
     return secrets.randbelow(2 ** 31 - 1) + 1
 
 
+def redact_secrets(text: str, *secrets: str) -> str:
+    """Strip credentials out of text before it reaches a log, an error surfaced to the user, or the
+    agent's transcript.
+
+    The optional user token is a person's OWN credential (unlike the community key, which belongs to the
+    bot): an error string that happens to quote a request URL, or a VK message that echoes the token,
+    must not be what lands in ``errors.log``.
+    """
+    out = str(text or "")
+    for secret in secrets:
+        secret = str(secret or "")
+        if len(secret) >= 8:
+            out = out.replace(secret, "[REDACTED]")
+    return re.sub(r"(access_token=)[^&\s]+", r"\1[REDACTED]", out)
+
+
+def _best_video_file(items: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The largest downloadable ``mp4`` VK lists for a video, or ``None``.
+
+    A video attachment can expose only a watch page (no ``files`` block). That is not an error — it just
+    means there is nothing to hand to the agent, so the caller keeps its textual note.
+    """
+    for item in items:
+        files = item.get("files") or {}
+        for key in ("mp4_1080", "mp4_720", "mp4_480", "mp4_360", "mp4_240"):
+            url = files.get(key)
+            if url:
+                return {"url": str(url), "title": str(item.get("title") or "video"),
+                        "duration": int(item.get("duration") or 0), "ext": ".mp4"}
+    return None
+
+
 class VkClient:
     """Thin async wrapper over ``https://api.vk.com/method/*`` + the Long Poll endpoint."""
 
     def __init__(
         self, token: str, *, api_version: str = DEFAULT_API_VERSION,
         group_id: Optional[int] = None, session: Optional[aiohttp.ClientSession] = None,
+        user_token: str = "",
     ) -> None:
         self.token = token
+        # Optional USER token — a person's own VK account, needed only for the calls a community token
+        # cannot make (in practice ``video.get`` for inbound video). Empty means "do not even ask".
+        self.user_token = str(user_token or "").strip()
         self.api_version = api_version or DEFAULT_API_VERSION
         self.group_id = int(group_id or 0)
         self.group_name = ""
@@ -113,10 +150,18 @@ class VkClient:
         self._session = None
 
     async def call(self, method: str, *, timeout: float = 30.0, **params: Any) -> Any:
-        """POST ``method`` and return ``response``; raises :class:`VkApiError` on ``error``."""
+        """POST ``method`` as the community and return ``response``; raises :class:`VkApiError`."""
+        return await self.call_as(self.token, method, timeout=timeout, **params)
+
+    async def call_as(self, token: str, method: str, *, timeout: float = 30.0, **params: Any) -> Any:
+        """The same call with an explicit token — how the optional user token reaches ``video.get``.
+
+        One implementation for both: a second copy of the request/error handling would drift, and the
+        error classification (``retryable``, ``error_kind``) is exactly what callers depend on.
+        """
         session = await self._get_session()
         payload = {k: v for k, v in params.items() if v is not None}
-        payload["access_token"] = self.token
+        payload["access_token"] = token
         payload["v"] = self.api_version
         async with self._api_sem:
             try:
@@ -270,12 +315,37 @@ class VkClient:
         refused here (error 15) when video is restricted for the community; the adapter then sends the
         same bytes as a document, so the file still reaches the user.
         """
-        saved = await self.call("video.save", name=name or filename, is_private=1, wallpost=0, timeout=30) or {}
+        # video.save is a USER-scope method: a community key is refused outright (measured live, error 5),
+        # so the optional user token is what makes native video possible at all. Without it the call fails
+        # the usual way and the adapter falls back to sending the file as a document.
+        token = self.user_token or self.token
+        saved = await self.call_as(token, "video.save", name=name or filename, is_private=1,
+                                   wallpost=0, timeout=30) or {}
         upload_url, video_id = saved.get("upload_url"), saved.get("video_id")
         if not upload_url or not video_id:
             raise VkApiError("video.save", 0, f"no upload_url/video_id in response: {str(saved)[:200]}")
         await self._upload(upload_url, data, filename)
         return f"video{saved.get('owner_id')}_{video_id}"
+
+    async def get_video_file(self, video: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """A downloadable file for an INBOUND video, using the optional user token.
+
+        ``video.get`` is one of the calls a community token cannot make — measured live on our own
+        community key (2026-10-03): ``video.get`` and ``video.save`` both answer error 5
+        "User authorization failed". ``None`` means "cannot ask" (no user token configured) and the
+        caller keeps its note; a refusal by VK raises :class:`VkApiError` so the caller can log why —
+        after redacting the credential.
+        """
+        if not self.user_token:
+            return None
+        reference = f"{int(video.get('owner_id') or 0)}_{int(video.get('id') or 0)}"
+        if video.get("access_key"):
+            reference += f"_{video['access_key']}"
+        response = await self.call_as(self.user_token, "video.get", videos=reference, timeout=30)
+        items = response.get("items") if isinstance(response, dict) else response
+        if isinstance(items, dict):  # a single-video response shape
+            items = [items]
+        return _best_video_file(list(items or []))
 
     # ------------------------------------------------------------------ messages
 

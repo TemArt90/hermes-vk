@@ -15,6 +15,10 @@ requires_env:
     url: "https://dev.vk.com/ru/api/bots/getting-started"
     password: true
 optional_env:
+  - name: VK_USER_TOKEN
+    description: "НЕОБЯЗАТЕЛЬНО и только для видео: личный ключ доступа ВКонтакте (ваша страница, права «Видео»). С ним входящее видео скачивается агенту, а исходящее уходит нативным вложением. Ключ сообщества такие вызовы не пропускает (ошибка 5). Без него видео остаётся пометкой в тексте, а файл уходит документом"
+    prompt: "Personal VK token for video (optional)"
+    password: true
   - name: VK_HOME_CHANNEL
     description: "VK id (peer id) для доставки cron-отчётов, например 1234567"
     prompt: "Home peer id"
