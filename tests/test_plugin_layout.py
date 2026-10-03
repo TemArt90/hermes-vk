@@ -77,3 +77,26 @@ def test_init_loads_as_a_package_and_stays_importable_as_a_bare_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)  # must not raise
     assert module.register is None, "a bare module load has nothing to register"
+
+
+if __name__ == "__main__":
+    # Same shape as the other test files' runners: without it a direct run exited 0 having executed
+    # NOTHING — a silent all-clear, which is the worst possible answer from a check script.
+    import sys
+    import traceback
+
+    tests = [(name, obj) for name, obj in sorted(globals().items())
+             if name.startswith("test_") and callable(obj)]
+    failures = []
+    for name, fn in tests:
+        try:
+            fn()
+        except Exception:
+            failures.append((name, traceback.format_exc()))
+            print(f"FAIL {name}")
+        else:
+            print(f"ok   {name}")
+    print(f"\n{len(tests) - len(failures)}/{len(tests)} passed")
+    for name, tb in failures:
+        print(f"\n=== {name} ===\n{tb}")
+    sys.exit(1 if failures else 0)
