@@ -262,6 +262,21 @@ class VkClient:
             raise VkApiError("docs.save", 0, "empty response")
         return f"doc{doc['owner_id']}_{doc['id']}"
 
+    async def upload_video(self, data: bytes, filename: str, *, name: str = "") -> str:
+        """Upload a video and return the ``video<owner>_<id>`` attachment string.
+
+        VK's flow is ``video.save`` — which reserves the video and hands back a per-file upload URL —
+        then the upload, after which the reserved id is a usable attachment. A community token can be
+        refused here (error 15) when video is restricted for the community; the adapter then sends the
+        same bytes as a document, so the file still reaches the user.
+        """
+        saved = await self.call("video.save", name=name or filename, is_private=1, wallpost=0, timeout=30) or {}
+        upload_url, video_id = saved.get("upload_url"), saved.get("video_id")
+        if not upload_url or not video_id:
+            raise VkApiError("video.save", 0, f"no upload_url/video_id in response: {str(saved)[:200]}")
+        await self._upload(upload_url, data, filename)
+        return f"video{saved.get('owner_id')}_{video_id}"
+
     # ------------------------------------------------------------------ messages
 
     async def send_message(

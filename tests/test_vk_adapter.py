@@ -235,6 +235,11 @@ class FakeClient:
         self.group_name = "Тестовое сообщество"
         self.conversations: list = []
         self.conversations_calls = 0
+        self.video_uploads: list = []
+
+    async def upload_video(self, data, filename, **kwargs):
+        self.video_uploads.append((filename, len(data)))
+        return "video-777_5"
 
     async def get_conversations(self, *, count=20):
         self.conversations_calls += 1
@@ -1394,6 +1399,9 @@ def test_standalone_send_skips_a_missing_file_and_keeps_the_report(monkeypatch, 
         async def upload_document(self, *args, **kwargs):
             return "doc-777_9"
 
+        async def upload_video(self, *args, **kwargs):
+            return "video-777_9"
+
         async def close(self):
             return None
 
@@ -1414,6 +1422,45 @@ def test_standalone_send_skips_a_missing_file_and_keeps_the_report(monkeypatch, 
     calls = holder["client"].sent
     assert len(calls) == 1                                  # подпись уехала с файлом, а не отдельно
     assert calls[0][1] == "отчёт" and calls[0][2]["attachment"] == "doc-777_9"
+
+
+def test_standalone_send_uploads_a_video_natively(monkeypatch, tmp_path):
+    """Cron reports can carry an .mp4: it must go out as a video attachment, not as a plain file, or the
+    scheduled path and the live path disagree about the same file."""
+    import vk.adapter as mod
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            self.sent: list = []
+
+        async def resolve_group(self):
+            return (777, "Тест")
+
+        async def send_message(self, peer_id, message, **kwargs):
+            self.sent.append((peer_id, message, kwargs))
+            return 42
+
+        async def upload_video(self, *args, **kwargs):
+            return "video-777_9"
+
+        async def close(self):
+            return None
+
+    holder: dict = {}
+
+    def _factory(*args, **kwargs):
+        holder["client"] = _Client()
+        return holder["client"]
+
+    monkeypatch.setattr(mod, "VkClient", _factory)
+    monkeypatch.setattr(mod, "extra_or_secret", lambda extra, key, env, default="": "vk1.a.TOKEN")
+    clip = tmp_path / "report.mp4"
+    clip.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"0" * 32)
+    with open_loop() as loop:
+        result = loop.run_until_complete(mod._standalone_send(
+            SimpleNamespace(extra={}), "123456", "отчёт", media_files=[str(clip)]))
+    assert result.get("success") is True
+    assert holder["client"].sent[0][2]["attachment"] == "video-777_9"
 
 
 # ── клавиатура команд по чатам ───────────────────────────────────────────────
@@ -1546,6 +1593,79 @@ def test_fallback_sweep_survives_a_client_error():
     with open_loop() as loop:
         alive = loop.run_until_complete(_drive())
     assert alive and attempts["n"] >= 2  # ошибка не убила цикл, он попробовал снова
+
+
+# ── исходящее видео ──────────────────────────────────────────────────────────
+
+def test_video_goes_out_as_a_native_video_attachment():
+    """The core routes ``.mp4`` to ``send_video``; without this override the base class only apologises
+    and the user never gets the file."""
+    adapter = make_adapter()
+    payload = pathlib.Path(__file__).read_bytes()
+    with open_loop() as loop:
+        result = loop.run_until_complete(adapter.send_video("123456", __file__, caption="клип"))
+    assert result.success
+    assert adapter.client.video_uploads == [(pathlib.Path(__file__).name, len(payload))]
+    assert adapter.client.sent[-1]["attachment"] == "video-777_5"
+
+
+def test_video_falls_back_to_a_document_when_vk_refuses_the_video_path():
+    """A community not allowed to upload video must still receive the file, not an apology."""
+    from gateway.platforms.base import SendResult
+    adapter = make_adapter()
+    seen: list = []
+
+    async def _capture(chat_id, source, *, kind, caption=None, **kwargs):
+        seen.append(kind)
+        return SendResult(success=(kind != "video"), error=None if kind != "video" else "video refused")
+
+    adapter._send_attachment = _capture
+    with open_loop() as loop:
+        result = loop.run_until_complete(adapter.send_video("123456", __file__))
+    assert seen == ["video", "doc"] and result.success
+
+
+def test_client_video_upload_reserves_uploads_and_returns_the_attachment():
+    """Three steps in one call: ``video.save`` reserves, the bytes go to the returned URL, and the
+    reserved id becomes the attachment. A wrong order — or a skipped upload — yields a broken string."""
+    from vk.vk_api import VkClient
+    client = VkClient("vk1.a.MOCK")
+    calls: list = []
+    uploads: list = []
+
+    async def _call(method, **params):
+        calls.append((method, params))
+        return {"upload_url": "https://up.example/v", "video_id": 5, "owner_id": -777}
+
+    async def _upload(url, data, filename):
+        uploads.append((url, filename, len(data)))
+        return {}
+
+    client.call, client._upload = _call, _upload
+    with open_loop() as loop:
+        attachment = loop.run_until_complete(client.upload_video(b"f" * 10, "клип.mp4"))
+    assert attachment == "video-777_5"
+    assert calls == [("video.save", {"name": "клип.mp4", "is_private": 1, "wallpost": 0, "timeout": 30})]
+    assert uploads == [("https://up.example/v", "клип.mp4", 10)]
+
+
+def test_client_video_upload_fails_loudly_without_an_upload_url():
+    """Without this check a community that cannot take video would get a blank attachment string, which
+    VK rejects — and the user would see nothing at all."""
+    from vk.vk_api import VkApiError, VkClient
+    client = VkClient("vk1.a.MOCK")
+
+    async def _call(method, **params):
+        return {"video_id": 0}
+
+    client.call = _call
+    caught = None
+    with open_loop() as loop:
+        try:
+            loop.run_until_complete(client.upload_video(b"f" * 10, "клип.mp4"))
+        except VkApiError as exc:
+            caught = exc
+    assert caught is not None and "video_id" in caught.message
 
 
 if __name__ == "__main__":

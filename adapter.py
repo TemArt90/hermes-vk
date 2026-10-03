@@ -1080,6 +1080,10 @@ class VKAdapter(BasePlatformAdapter):
             raise ValueError(f"{filename} is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
         if kind == "photo":
             return await self.client.upload_photo(data, filename)
+        if kind == "video":
+            # video.save → upload → attach. The caller (send_video) falls back to a document when VK
+            # refuses the video path for this community.
+            return await self.client.upload_video(data, filename)
         # Documents and voice messages need the conversation peer: VK rejects peer_id=0 there
         # ("peer_id is invalid"), which silently broke every file and voice send.
         return await self.client.upload_document(data, filename, kind=kind, peer_id=int(chat_id))
@@ -1137,6 +1141,22 @@ class VKAdapter(BasePlatformAdapter):
         return await self._send_attachment(
             chat_id, file_path, kind="doc", caption=caption, filename=file_name,
             reply_to=reply_to, metadata=metadata)
+
+    async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
+                         **kwargs) -> SendResult:
+        """Send a video as a native VK video attachment (``video.save`` + upload).
+
+        The base class default only reports that native video is unavailable, so without this override
+        every ``.mp4`` (cron reports, ``MEDIA:`` deliveries) reached the user as a warning instead of a
+        file. When VK refuses the video path for a community, the same bytes go as a document.
+        """
+        result = await self._send_attachment(
+            chat_id, video_path, kind="video", caption=caption, reply_to=reply_to, metadata=metadata)
+        if not result.success:  # e.g. the community is not allowed to upload video
+            return await self._send_attachment(
+                chat_id, video_path, kind="doc", caption=caption, reply_to=reply_to, metadata=metadata)
+        return result
 
     async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None,
                          reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
@@ -1218,6 +1238,9 @@ async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id: Op
                 data = await _voice_to_ogg_opus(data)
                 name = (os.path.splitext(name)[0] or "voice") + ".ogg"
                 attachment = await client.upload_document(data, name, kind="audio_message", peer_id=peer_id)
+            elif not force_document and (mimetypes.guess_type(path)[0] or "").startswith("video/"):
+                # Same native video attachment as the live adapter; video.save only needs the bytes.
+                attachment = await client.upload_video(data, name)
             elif not force_document and (mimetypes.guess_type(path)[0] or "").startswith("image/"):
                 attachment = await client.upload_photo(data, name)
             else:
