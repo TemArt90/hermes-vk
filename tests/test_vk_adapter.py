@@ -1190,6 +1190,225 @@ def test_platform_hint_promises_only_markup_the_renderer_can_deliver():
     assert "4096" in hint                      # the split limit stays documented for the model
 
 
+# ── интерфейсы, которые вызывает ядро (плагин-менеджер, статус, cron) ────────
+
+def test_check_requirements_is_false_without_a_token(monkeypatch):
+    """`hermes plugins` shows a channel as ready/disabled by this probe: a false positive would
+    advertise a channel that cannot connect, and a false negative hides a working one."""
+    import vk.adapter as mod
+    monkeypatch.setattr(mod, "get_scoped_secret", lambda name, default="": default)
+    assert mod.check_requirements() is False
+
+
+def test_check_requirements_is_true_with_a_token(monkeypatch):
+    import vk.adapter as mod
+    monkeypatch.setattr(mod, "get_scoped_secret",
+                        lambda name, default="": "vk1.a.TOKEN" if name == "VK_TOKEN" else default)
+    assert mod.check_requirements() is True
+
+
+def test_validate_config_accepts_a_token_from_config_or_environment(monkeypatch):
+    import vk.adapter as mod
+    monkeypatch.setattr(mod, "get_scoped_secret", lambda name, default="": default)
+    assert mod.validate_config(SimpleNamespace(extra={"token": "t"})) is True
+    assert mod.validate_config(SimpleNamespace(extra={})) is False
+    assert mod.is_connected(SimpleNamespace(extra={"token": "t"})) is True
+
+
+def test_env_enablement_seeds_the_cron_home_channel(monkeypatch):
+    """Env-only setups (no config.yaml) must still show up in status and know where cron delivers:
+    this is the function the core calls to learn VK_HOME_CHANNEL."""
+    import vk.adapter as mod
+    import gateway.platforms._shared as shared
+
+    def _reader(name, default=""):
+        # Both readers must be stubbed: _env_enablement reads the token itself, while the home-channel
+        # row is seeded inside the framework helper, which imports its own get_scoped_secret.
+        return {"VK_TOKEN": "vk1.a.TOKEN", "VK_HOME_CHANNEL": "13580122",
+                "VK_QUOTE_IN_GROUPS": "false"}.get(name, default)
+
+    monkeypatch.setattr(mod, "get_scoped_secret", _reader)
+    monkeypatch.setattr(shared, "get_scoped_secret", _reader)
+    seeded = mod._env_enablement()
+    assert seeded and seeded["token"] == "vk1.a.TOKEN"
+    assert "13580122" in str(seeded)                 # the home peer travelled to the core
+    assert seeded.get("quote_in_groups") is False    # the string "false" was parsed, not copied
+    monkeypatch.setattr(mod, "get_scoped_secret", lambda name, default="": default)
+    assert mod._env_enablement() is None             # no token → nothing to seed
+
+
+# ── кавычки, состояние «печатает», сведения о чате ───────────────────────────
+
+def test_group_answer_quotes_the_last_inbound_while_a_dm_never_does():
+    """VK's reference behaviour: in a беседа the answer quotes the message it answers; a DM has nothing
+    to quote. The rule is enforced in send(), not in the caller — hence the test goes through send()."""
+    adapter = make_adapter({"quote_in_groups": True})
+    adapter._last_inbound[str(GROUP_PEER)] = "900"
+    adapter._last_inbound["123456"] = "500"
+    with open_loop() as loop:
+        loop.run_until_complete(adapter.send(str(GROUP_PEER), "ответ"))
+        loop.run_until_complete(adapter.send("123456", "ответ"))
+    group_call, dm_call = adapter.client.sent
+    assert group_call["reply_to"] == 900
+    assert dm_call["reply_to"] is None
+
+
+def test_send_typing_marks_the_dialog_as_typing():
+    adapter = make_adapter()
+    with open_loop() as loop:
+        loop.run_until_complete(adapter.send_typing("123456"))
+    assert adapter.client.activity == (123456, "typing")
+
+
+def test_get_chat_info_names_a_dm_by_user_and_a_group_by_title():
+    adapter = make_adapter()
+    with open_loop() as loop:
+        dm = loop.run_until_complete(adapter.get_chat_info("123456"))
+        group = loop.run_until_complete(adapter.get_chat_info(str(GROUP_PEER)))
+    assert dm == {"name": "Иван", "type": "dm", "chat_id": "123456"}
+    assert group["type"] == "group" and group["name"] == "Рабочая беседа"
+
+
+def test_media_wrappers_map_to_the_expected_upload_kind():
+    """The core picks the wrapper (send_image_file / send_document / send_voice); a wrong kind would
+    silently deliver a picture as a file, so the mapping is pinned here."""
+    from gateway.platforms.base import SendResult
+    adapter = make_adapter()
+    seen: list = []
+
+    async def _capture(chat_id, source, *, kind, caption=None, **kwargs):
+        seen.append(kind)
+        return SendResult(success=True, message_id="1")
+
+    adapter._send_attachment = _capture
+    with open_loop() as loop:
+        loop.run_until_complete(adapter.send_image_file("123456", __file__))
+        loop.run_until_complete(adapter.send_document("123456", __file__))
+        loop.run_until_complete(adapter.send_voice("123456", __file__))
+    assert seen == ["photo", "doc", "voice"]
+
+
+def test_voice_falls_back_to_a_file_when_the_transcode_fails():
+    """No ffmpeg → the audio still has to arrive, as a document. Losing the user's recording because a
+    transcoder is missing is the failure this guards."""
+    from gateway.platforms.base import SendResult
+    adapter = make_adapter()
+    seen: list = []
+
+    async def _capture(chat_id, source, *, kind, caption=None, **kwargs):
+        seen.append(kind)
+        return SendResult(success=(kind != "voice"), error=None if kind != "voice" else "no ffmpeg")
+
+    adapter._send_attachment = _capture
+    with open_loop() as loop:
+        result = loop.run_until_complete(adapter.send_voice("123456", __file__))
+    assert seen == ["voice", "doc"] and result.success
+
+
+# ── входящее: служебные апдейты, альбомы ─────────────────────────────────────
+
+def test_service_updates_never_reach_the_agent():
+    """Typing/read/allow/deny updates arrive constantly. Dispatching them would wake the agent (and
+    bill a model call) for nothing."""
+    adapter = make_adapter()
+    seen = capture_events(adapter)
+    with open_loop() as loop:
+        for kind in ("message_typing_state", "message_read", "message_allow", "message_deny"):
+            loop.run_until_complete(adapter._dispatch({"type": kind, "object": {"peer_id": 123456}}))
+    assert seen == []
+
+
+def test_album_of_photos_is_cached_whole():
+    """Two screenshots in one message: both must reach the agent — a model asked to compare two
+    pictures sees a single one otherwise."""
+    adapter = make_adapter()
+    adapter.client = RecordingClient()
+    seen = capture_events(adapter)
+    run_inbound(adapter, {**GROUP_MSG, "attachments": [
+        {"type": "photo", "photo": {"sizes": [{"width": 10, "url": "https://sun9-1.userapi.com/a.jpg"}]}},
+        {"type": "photo", "photo": {"sizes": [{"width": 10, "url": "https://sun9-1.userapi.com/b.jpg"}]}},
+    ]}, "album")
+    assert len(seen[0].media_urls) == 2
+    assert len(adapter.client.downloads) == 2
+
+
+def test_unknown_attachment_types_are_described_not_swallowed():
+    """A survey, a sticker or a wall post must still be *visible* to the agent as a note — silence made
+    the model answer as if nothing had been sent."""
+    adapter = make_adapter()
+    seen = capture_events(adapter)
+    run_inbound(adapter, {**GROUP_MSG, "attachments": [
+        {"type": "sticker", "sticker": {"id": 1}},
+        {"type": "wall", "wall": {"id": 2}},
+        {"type": "poll", "poll": {"id": 3}},
+    ]}, "odd")
+    assert "[стикер]" in seen[0].text and "[запись со стены]" in seen[0].text and "[poll]" in seen[0].text
+
+
+# ── метки кнопок и пределы VK ────────────────────────────────────────────────
+
+def test_button_labels_are_truncated_to_the_vk_limit():
+    """VK rejects a keyboard whose label is longer than 40 characters; a trimmed label with an ellipsis
+    beats an answer that never arrives with its buttons."""
+    from vk.adapter import MAX_BUTTON_LABEL, _kill
+    assert _kill("x" * 100, MAX_BUTTON_LABEL) == "x" * (MAX_BUTTON_LABEL - 1) + "…"
+    assert _kill("коротко", MAX_BUTTON_LABEL) == "коротко"
+    assert _kill("  обрезать пробелы  ", MAX_BUTTON_LABEL) == "обрезать пробелы"
+
+
+# ── автономная отправка (cron) ───────────────────────────────────────────────
+
+def test_standalone_send_without_a_token_reports_an_error_instead_of_raising(monkeypatch):
+    """Cron delivery returns a failure dict the scheduler can log; an exception would abort the job and
+    the reason would vanish into a traceback. The envelope itself carries ``error`` (no ``success``)."""
+    import vk.adapter as mod
+    monkeypatch.setattr(mod, "extra_or_secret", lambda extra, key, env, default="": default)
+    with open_loop() as loop:
+        result = loop.run_until_complete(mod._standalone_send(SimpleNamespace(extra={}), "123456", "отчёт"))
+    assert "error" in result and "VK_TOKEN" in result["error"]
+
+
+def test_standalone_send_skips_a_missing_file_and_keeps_the_report(monkeypatch, tmp_path):
+    """A report must not be lost because one attachment disappeared between listing and sending — and a
+    single-chunk caption rides with the first file instead of costing the user a second message."""
+    import vk.adapter as mod
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            self.sent: list = []
+
+        async def resolve_group(self):
+            return (777, "Тест")
+
+        async def send_message(self, peer_id, message, **kwargs):
+            self.sent.append((peer_id, message, kwargs))
+            return 42
+
+        async def upload_document(self, *args, **kwargs):
+            return "doc-777_9"
+
+        async def close(self):
+            return None
+
+    holder: dict = {}
+
+    def _factory(*args, **kwargs):
+        holder["client"] = _Client()
+        return holder["client"]
+
+    monkeypatch.setattr(mod, "VkClient", _factory)
+    monkeypatch.setattr(mod, "extra_or_secret", lambda extra, key, env, default="": "vk1.a.TOKEN")
+    report = tmp_path / "report.txt"
+    report.write_text("данные", encoding="utf-8")
+    with open_loop() as loop:
+        result = loop.run_until_complete(mod._standalone_send(
+            SimpleNamespace(extra={}), "123456", "отчёт", media_files=[str(tmp_path / "нет.txt"), str(report)]))
+    assert result.get("success") is True
+    calls = holder["client"].sent
+    assert len(calls) == 1                                  # подпись уехала с файлом, а не отдельно
+    assert calls[0][1] == "отчёт" and calls[0][2]["attachment"] == "doc-777_9"
+
+
 if __name__ == "__main__":
     tests = [(name, obj) for name, obj in sorted(globals().items())
              if name.startswith("test_") and callable(obj)]
