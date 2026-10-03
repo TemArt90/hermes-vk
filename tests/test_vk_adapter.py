@@ -559,11 +559,14 @@ def test_command_keyboard_is_a_persistent_bot_keyboard():
     ties it to a single message or hides it after the first tap.
     """
     payload = json.loads(command_keyboard())
-    assert "inline" not in payload and payload["one_time"] is False
+    assert payload["inline"] is False and payload["one_time"] is False
     rows = [[button["action"]["label"] for button in row] for row in payload["buttons"]]
     assert rows == [["/help", "/status"], ["/new", "/stop"]]
     assert all(button["action"]["type"] == "text" for row in payload["buttons"] for button in row)
     assert all(len(label) <= 40 for row in rows for label in row)
+    # the payload is what lets a tap be identified in the inbound event
+    assert [json.loads(b["action"]["payload"])["cmd"] for row in payload["buttons"] for b in row] == \
+        ["help", "status", "new", "stop"]
 
 
 def test_command_keyboard_is_attached_only_when_enabled():
@@ -574,6 +577,44 @@ def test_command_keyboard_is_attached_only_when_enabled():
         loop.run_until_complete(on.send("123456", "просто текст"))
     assert off.client.sent[0].get("keyboard") is None
     assert on.client.sent[0]["keyboard"] == command_keyboard()
+
+
+def test_standalone_send_attaches_command_keyboard_when_enabled():
+    """Cron reports and `hermes send` land in the same chat, so they must carry the keyboard too —
+    a message without it can leave the client without the buttons the user turned on."""
+    import vk.adapter as adapter_mod
+
+    sent = []
+
+    class FakeClient:
+        def __init__(self, token, api_version=None):
+            self.token = token
+
+        async def resolve_group(self):
+            return (777, "Mock")
+
+        async def send_message(self, peer_id, message, **kwargs):
+            sent.append({"message": message, **kwargs})
+            return 1
+
+        async def close(self):
+            pass
+
+    original = adapter_mod.VkClient
+    adapter_mod.VkClient = FakeClient
+    try:
+        with open_loop() as loop:
+            loop.run_until_complete(adapter_mod._standalone_send(
+                SimpleNamespace(extra={"token": "vk1.a.MOCK", "command_keyboard": True}),
+                "1234567", "отчёт готов"))
+            on = sent[-1]
+            loop.run_until_complete(adapter_mod._standalone_send(
+                SimpleNamespace(extra={"token": "vk1.a.MOCK"}), "1234567", "отчёт готов"))
+            off = sent[-1]
+    finally:
+        adapter_mod.VkClient = original
+    assert on["keyboard"] == command_keyboard()
+    assert off.get("keyboard") is None
 
 
 if __name__ == "__main__":

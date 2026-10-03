@@ -106,10 +106,16 @@ def command_keyboard() -> Optional[str]:
 
     A ``text`` button sends its own label as the user's message, so a button labelled ``/help`` is
     indistinguishable from typing it — the tap arrives as an ordinary slash command.
+
+    ``"inline": false`` is set explicitly: VK's documentation shows the field in every keyboard
+    example and it is what selects the chat keyboard (under the input) over an inline one. The
+    ``payload`` rides along in the inbound event, which is how a tap can be identified server-side —
+    VK never returns a bot keyboard back through ``messages.getById``/``getHistory``.
     """
-    rows = [[{"action": {"type": "text", "label": _kill(label, MAX_BUTTON_LABEL)},
+    rows = [[{"action": {"type": "text", "label": _kill(label, MAX_BUTTON_LABEL),
+                         "payload": json.dumps({"cmd": label.lstrip("/")}, separators=(",", ":"))},
               "color": "secondary"} for label in row] for row in _COMMAND_KEYBOARD_ROWS]
-    return json.dumps({"one_time": False, "buttons": rows}, ensure_ascii=False)
+    return json.dumps({"inline": False, "one_time": False, "buttons": rows}, ensure_ascii=False)
 
 
 def _keyboard(rows: List[List[Tuple[str, Optional[Dict[str, Any]], str]]]) -> Optional[str]:
@@ -822,6 +828,9 @@ async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id: Op
     token = str(extra_or_secret(extra, "token", "VK_TOKEN", "") or "").strip()
     if not token:
         return send_error("VK standalone send: VK_TOKEN is not configured")
+    # Same keyboard as the live adapter: cron reports and `hermes send` land in the SAME chat, and a
+    # message without it may leave the client without the buttons the user enabled.
+    keyboard = command_keyboard() if _truthy(extra, "VK_COMMAND_KEYBOARD", "command_keyboard", False) else None
     client = VkClient(token, api_version=str(extra.get("api_version") or DEFAULT_API_VERSION))
     try:
         try:
@@ -843,7 +852,7 @@ async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id: Op
             for text, format_data in pending:
                 if not text.strip() and len(pending) > 1:
                     continue
-                last_id = await client.send_message(peer_id, text, format_data=format_data)
+                last_id = await client.send_message(peer_id, text, format_data=format_data, keyboard=keyboard)
         for index, (path, is_voice) in enumerate(media):
             with open(path, "rb") as handle:
                 data = handle.read()
@@ -857,7 +866,8 @@ async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id: Op
             else:
                 attachment = await client.upload_document(data, name)
             caption, caption_fmt = pairing if (pairing and index == 0) else ("", None)
-            last_id = await client.send_message(peer_id, caption, format_data=caption_fmt, attachment=attachment)
+            last_id = await client.send_message(
+                peer_id, caption, format_data=caption_fmt, attachment=attachment, keyboard=keyboard)
         return {"success": True, "message_id": str(last_id or "")}
     except VkApiError as exc:
         return send_error(f"VK standalone send failed: {exc}")
