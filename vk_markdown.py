@@ -292,6 +292,21 @@ def _render_table_block(block: Sequence[str]) -> str:
     return "\n\n".join(groups) if groups else "\n".join(block)
 
 
+def _strip_quote_prefix(line: str) -> str:
+    """The line as the table detector must see it: ``> |a|b|`` is still a table row.
+
+    A model quoting a table in a blockquote used to slip past the detector (the line starts with ``>``,
+    not ``|``), so the whole grid — pipes and dash rows — reached the phone verbatim.
+    """
+    stripped = line.lstrip()
+    if stripped.startswith(">"):
+        stripped = stripped[1:]
+        if stripped.startswith(" "):
+            stripped = stripped[1:]
+        return stripped
+    return line
+
+
 def render_tables(text: str) -> str:
     """Rewrite GFM pipe tables as heading + bullets; fenced code and stray pipes are left alone.
 
@@ -299,7 +314,7 @@ def render_tables(text: str) -> str:
     into unreadable soup (live report: ``|||`` / ``|---|---|`` / ``|Статус|раскатка завершена|``). Discord
     solves this with the framework's ``convert_table_to_bullets``; this is the same idea with the
     header-label shift handled explicitly, then fed to the normal markdown renderer so headings still
-    arrive bold.
+    arrive bold. Quoted rows (``> |…|``) are converted too, losing the quote marker along with the grid.
     """
     if "|" not in text:
         return text
@@ -312,12 +327,12 @@ def render_tables(text: str) -> str:
         line = lines[index]
         is_fence = line.lstrip().startswith("```")
         in_fence ^= is_fence
-        if (not in_fence and not is_fence and "|" in line
-                and index + 1 < len(lines) and separator.match(lines[index + 1])):
+        next_line = _strip_quote_prefix(lines[index + 1]) if index + 1 < len(lines) else ""
+        if (not in_fence and not is_fence and "|" in _strip_quote_prefix(line) and separator.match(next_line)):
             end = index + 2
-            while end < len(lines) and "|" in lines[end].strip():
+            while end < len(lines) and "|" in _strip_quote_prefix(lines[end]).strip():
                 end += 1
-            out.append(_render_table_block(lines[index:end]))
+            out.append(_render_table_block([_strip_quote_prefix(item) for item in lines[index:end]]))
             index = end
             continue
         out.append(line)

@@ -206,6 +206,25 @@ async def scenario_cursor_survives_a_transport_error() -> None:
         await mock.stop()
 
 
+# ── pytest entry points: the live loop must run in CI, not only by hand ───────
+#
+# Until now this file was a standalone script only (`python tests/test_vk_live_loop.py`), so pytest —
+# and therefore CI — collected ZERO tests from it: the connect → long poll → inbound → send →
+# disconnect path, the failed=1/2 recovery and the cursor-survives-a-transport-error regression were
+# proven on the developer's machine and nowhere else. These three wrappers put them in the suite.
+
+def test_live_loop_connects_receives_and_sends():
+    asyncio.run(scenario_connect_and_receive(fail_first_session=False))
+
+
+def test_live_loop_recovers_a_dropped_session():
+    asyncio.run(scenario_connect_and_receive(fail_first_session=True))
+
+
+def test_live_loop_keeps_the_cursor_across_a_transport_error():
+    asyncio.run(scenario_cursor_survives_a_transport_error())
+
+
 if __name__ == "__main__":
     try:
         run()

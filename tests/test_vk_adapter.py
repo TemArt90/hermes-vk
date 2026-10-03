@@ -1115,6 +1115,81 @@ def test_ffmpeg_is_absent_when_neither_path_nor_tools_has_it():
         shutil.rmtree(root, ignore_errors=True)
 
 
+# ── рендер: вложенность, длинные токены, границы чанков ──────────────────────
+
+def test_link_inside_bold_keeps_both_items():
+    """Nested markup the model really writes: a bold line containing a tappable link.
+
+    Both facts must survive — the link has to stay tappable (that is what a user notices) and the bold
+    must not be dropped, because VK voids the WHOLE ``format_data`` payload when any item is malformed.
+    """
+    text, fmt = render_chunks("**см. [док](https://example.com)**")[0]
+    assert text == "см. док"
+    kinds = {item["type"] for item in fmt["items"]}
+    assert kinds == {"bold", "url"}
+    url_item = next(item for item in fmt["items"] if item["type"] == "url")
+    assert url_item["url"] == "https://example.com"
+    assert text[url_item["offset"]:url_item["offset"] + url_item["length"]] == "док"
+
+
+def test_long_unbroken_token_is_split_not_dropped():
+    """A 9000-character token (a long URL, a base64 blob) has no space to split on. VK rejects such a
+    message whole, so the renderer must break it itself — and lose nothing while doing it."""
+    source = "a" * 9000
+    chunks = render_chunks(source, 4000)
+    assert len(chunks) >= 3
+    assert "".join(text for text, _ in chunks) == source
+    assert all(len(text) <= 4000 for text, _ in chunks)
+
+
+def test_emoji_heavy_text_survives_chunking_whole():
+    """2000 rockets are 4000 UTF-16 units — exactly the limit, so the split lands next to a surrogate
+    pair. A chunk cutting a pair in half renders as a broken symbol, and anything dropped is invisible."""
+    source = "🚀" * 2000 + " конец"
+    chunks = render_chunks(source, 4000)
+    assert "".join(text for text, _ in chunks) == source
+    assert sum(text.count("🚀") for text, _ in chunks) == 2000
+
+
+def test_empty_content_renders_one_empty_chunk():
+    """Callers pass ``content or ""``: an exception here would kill the answer before it is attempted."""
+    chunks = render_chunks("")
+    assert len(chunks) == 1 and chunks[0][0] == ""
+
+
+def test_table_inside_a_quote_is_converted_like_a_table():
+    """A model quoting a table (``> |Сервис|Статус|``) must not put pipes and dash rows on a phone."""
+    text, _ = render_chunks("> | Сервис | Статус |\n> |---|---|\n> | API | ок |")[0]
+    assert "|" not in text and "---" not in text
+    assert "API" in text and "ок" in text
+
+
+def _registered_platform_kwargs() -> dict:
+    """What the plugin hands the core in ``register()`` — the model reads ``platform_hint`` as truth."""
+    from vk.adapter import register
+    captured: dict = {}
+
+    class _Ctx:
+        def register_platform(self, **kwargs):
+            captured.update(kwargs)
+
+    register(_Ctx())
+    return captured
+
+
+def test_platform_hint_promises_only_markup_the_renderer_can_deliver():
+    """Measured defect: the hint claimed VK renders ``~~strike~~``. It does not — every marker outside
+    ``VK_SAFE_ITEM_TYPES`` is stripped, so the emphasis arrived as plain text on the user's phone.
+
+    The hint may still *mention* strike and underline, but only as markup that does NOT survive.
+    """
+    hint = _registered_platform_kwargs()["platform_hint"]
+    assert "~~" not in hint                    # strikethrough is never offered as usable syntax
+    assert "arrives as plain text" in hint     # the limitation is stated, not left to be discovered
+    assert "**" in hint and "italic" in hint and "link" in hint
+    assert "4096" in hint                      # the split limit stays documented for the model
+
+
 if __name__ == "__main__":
     tests = [(name, obj) for name, obj in sorted(globals().items())
              if name.startswith("test_") and callable(obj)]
