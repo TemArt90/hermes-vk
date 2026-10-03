@@ -115,17 +115,15 @@ def exchange_request(flow: str, *, app_id: str, code: str, redirect_uri: str, se
     the legacy one answers ``client_secret is incorrect`` without a secret, the VK ID one answers
     ``device id is missing`` without a device id (it expects the VK ID SDK to supply one)."""
     if flow == "vkid":
-        url = VK_ID_ENDPOINT
         form = {
             "grant_type": "authorization_code", "client_id": app_id, "code": code,
             "redirect_uri": redirect_uri, "client_secret": secret, "device_id": device_id,
             "code_verifier": code_verifier, "state": "hermes-vk",
         }
-        return url, {k: v for k, v in form.items() if v}
-    url = LEGACY_TOKEN_ENDPOINT
+        return VK_ID_ENDPOINT, {k: v for k, v in form.items() if v}
     form = {"client_id": app_id, "client_secret": secret, "redirect_uri": redirect_uri,
             "code": code, "v": DEFAULT_API_VERSION}
-    return url, {k: v for k, v in form.items() if v}
+    return LEGACY_TOKEN_ENDPOINT, {k: v for k, v in form.items() if v}
 
 
 def refresh_request(flow: str, *, app_id: str, refresh_token: str, secret: str, device_id: str = "") -> tuple:
@@ -212,7 +210,7 @@ async def verify(token: str, community_token: str, group_id: int) -> int:
         await client.close()
 
 
-def _store_answer(answer: dict, secret: str, *, note: str = "") -> int:
+def _store_answer(answer: dict, *, note: str = "") -> int:
     """Write what VK returned (never echoing it) and report the measurable facts: length, lifetime."""
     token = answer.get("access_token") or ""
     if not token:
@@ -293,7 +291,7 @@ def main(argv=None) -> int:
         # Запоминаем, чем получен ключ: refresh и status больше не нужно настраивать вручную.
         write_env_value(ENV_FILE, "VK_APP_ID", args.app_id)
         write_env_value(ENV_FILE, "VK_AUTH_FLOW", args.flow)
-        return _store_answer(answer, secret)
+        return _store_answer(answer)
 
     if args.command == "refresh":
         values = read_env_values()
@@ -319,7 +317,7 @@ def main(argv=None) -> int:
         if "error" in answer:
             print(f"  ОТКАЗ: {answer.get('error')} — {redact(str(answer.get('error_description')), secret)}")
             return 1
-        return _store_answer(answer, secret, note=" (обновление по refresh_token)")
+        return _store_answer(answer, note=" (обновление по refresh_token)")
 
     if args.command == "status":
         values = read_env_values()
