@@ -1239,8 +1239,14 @@ async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id: Op
                 name = (os.path.splitext(name)[0] or "voice") + ".ogg"
                 attachment = await client.upload_document(data, name, kind="audio_message", peer_id=peer_id)
             elif not force_document and (mimetypes.guess_type(path)[0] or "").startswith("video/"):
-                # Same native video attachment as the live adapter; video.save only needs the bytes.
-                attachment = await client.upload_video(data, name)
+                # Native video is best-effort: VK answers ``video.save`` with error 5 ("User
+                # authorization failed") for a community token — measured live, not assumed — so a
+                # refusal must degrade to a document instead of losing the whole report.
+                try:
+                    attachment = await client.upload_video(data, name)
+                except VkApiError as exc:
+                    logger.info("VK: video upload refused (%s) — sending %s as a document", exc.code, name)
+                    attachment = await client.upload_document(data, name, peer_id=peer_id)
             elif not force_document and (mimetypes.guess_type(path)[0] or "").startswith("image/"):
                 attachment = await client.upload_photo(data, name)
             else:

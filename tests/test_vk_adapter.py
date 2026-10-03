@@ -1463,6 +1463,52 @@ def test_standalone_send_uploads_a_video_natively(monkeypatch, tmp_path):
     assert holder["client"].sent[0][2]["attachment"] == "video-777_9"
 
 
+def test_standalone_send_falls_back_to_a_document_when_video_is_refused(monkeypatch, tmp_path):
+    """Measured live: a community token gets ``video.save`` error 5, and the earlier code lost the WHOLE
+    report because the refusal escaped the media loop. The file must arrive as a document instead."""
+    import vk.adapter as mod
+    from vk.vk_api import VkApiError
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            self.sent: list = []
+            self.documents: list = []
+
+        async def resolve_group(self):
+            return (777, "Тест")
+
+        async def send_message(self, peer_id, message, **kwargs):
+            self.sent.append((peer_id, message, kwargs))
+            return 42
+
+        async def upload_video(self, *args, **kwargs):
+            raise VkApiError("video.save", 5, "User authorization failed")
+
+        async def upload_document(self, data, filename, **kwargs):
+            self.documents.append(filename)
+            return "doc-777_9"
+
+        async def close(self):
+            return None
+
+    holder: dict = {}
+
+    def _factory(*args, **kwargs):
+        holder["client"] = _Client()
+        return holder["client"]
+
+    monkeypatch.setattr(mod, "VkClient", _factory)
+    monkeypatch.setattr(mod, "extra_or_secret", lambda extra, key, env, default="": "vk1.a.TOKEN")
+    clip = tmp_path / "report.mp4"
+    clip.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"0" * 32)
+    with open_loop() as loop:
+        result = loop.run_until_complete(mod._standalone_send(
+            SimpleNamespace(extra={}), "123456", "отчёт", media_files=[str(clip)]))
+    assert result.get("success") is True
+    assert holder["client"].documents == ["report.mp4"]
+    assert holder["client"].sent[0][2]["attachment"] == "doc-777_9"
+
+
 # ── клавиатура команд по чатам ───────────────────────────────────────────────
 
 def test_command_keyboard_is_decided_per_chat():
