@@ -81,6 +81,31 @@ def test_init_loads_as_a_package_and_stays_importable_as_a_bare_module():
     assert module.register is None, "a bare module load has nothing to register"
 
 
+def test_operator_tool_ships_and_answers_without_the_runtime():
+    """``scripts/vk-user-token.py`` is the documented way to get a personal token — it must be present,
+    runnable by the operator's interpreter, and usable without importing the Hermes runtime: the commands
+    that only print a consent URL or write an already-issued token must work on a bare Python.
+
+    (The commands that call VK — ``status``, ``exchange`` — do need ``tests/_paths.py``; that is why the
+    check pins the runtime-free ones: a packaging change that breaks the tool would otherwise be silent.)
+    """
+    import subprocess
+    import sys
+
+    tool = PLUGIN_DIR / "scripts" / "vk-user-token.py"
+    assert tool.is_file(), f"the personal-token tool is missing: {tool}"
+
+    helps = subprocess.run([sys.executable, str(tool), "--help"], capture_output=True, text=True, timeout=60)
+    assert helps.returncode == 0, f"--help failed: {helps.stderr[-200:]}"
+    for command in ("authorize", "exchange", "refresh", "store", "status"):
+        assert command in helps.stdout, f"command {command!r} is not advertised by --help"
+
+    url = subprocess.run([sys.executable, str(tool), "authorize", "--app-id", "1", "--flow", "implicit"],
+                         capture_output=True, text=True, timeout=60)
+    assert url.returncode == 0, f"authorize failed: {url.stderr[-200:]}"
+    assert "oauth.vk.com/authorize" in url.stdout and "scope=video" in url.stdout
+
+
 if __name__ == "__main__":
     # Same shape as the other test files' runners: without it a direct run exited 0 having executed
     # NOTHING — a silent all-clear, which is the worst possible answer from a check script.

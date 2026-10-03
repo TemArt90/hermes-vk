@@ -23,7 +23,10 @@ grep -i "VK: connected to community" ~/.hermes/logs/agent.log | tail -1
 # 5. Живая проверка: сообщение, кнопка, файл
 hermes send --to vk:<peer_id> "проверка после обновления"
 
-# 6. Состояние транспорта
+# 6. Личный токен, если он нужен для видео (иначе шаг пропускается)
+~/.hermes/hermes-agent/venv/bin/python ~/.hermes/plugins/platforms/vk/scripts/vk-user-token.py status
+
+# 7. Состояние транспорта
 grep -iE "VK: (long poll|fallback|upload|reaction)" ~/.hermes/logs/agent.log | tail -20
 ```
 
