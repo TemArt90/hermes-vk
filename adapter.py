@@ -186,6 +186,24 @@ def command_keyboard() -> Optional[str]:
     return json.dumps({"inline": False, "one_time": False, "buttons": rows}, ensure_ascii=False)
 
 
+def keyboard_for_peer(extra: Optional[dict], chat_id: str, fallback: bool = False) -> Optional[str]:
+    """The command keyboard for one chat, or ``None``.
+
+    Shared by the live adapter and the out-of-process cron sender on purpose: both must reach the same
+    decision, or a scheduled report arrives without the buttons the operator enabled for that chat. A
+    per-chat entry (``VK_COMMAND_KEYBOARD_BY_PEER='123456:true,789:false'``) wins over the global flag;
+    a chat with no entry inherits it.
+    """
+    extra = extra or {}
+    enabled = _truthy(extra, "VK_COMMAND_KEYBOARD", "command_keyboard", fallback)
+    overrides = _peer_bool_map(
+        _env(extra, "VK_COMMAND_KEYBOARD_BY_PEER", "command_keyboard_by_peer", None))
+    text = str(chat_id if chat_id is not None else "")
+    if text.isdigit() and int(text) in overrides:
+        enabled = overrides[int(text)]
+    return command_keyboard() if enabled else None
+
+
 def _keyboard(rows: List[List[Tuple[str, Optional[Dict[str, Any]], str]]]) -> Optional[str]:
     """VK inline keyboard JSON; callback rows carry a compact JSON payload."""
     buttons: List[List[Dict[str, Any]]] = []
@@ -268,6 +286,10 @@ class VKAdapter(BasePlatformAdapter):
         self.quote_in_groups = _truthy(extra, "VK_QUOTE_IN_GROUPS", "quote_in_groups", True)
         # Off by default: a persistent keyboard occupies space above the input field.
         self.command_keyboard = _truthy(extra, "VK_COMMAND_KEYBOARD", "command_keyboard", False)
+        # Per-chat override of that keyboard: one chat may want the buttons, another may find them in
+        # the way. Chats without an entry inherit the global flag.
+        self.command_keyboard_by_peer = _peer_bool_map(
+            _env(extra, "VK_COMMAND_KEYBOARD_BY_PEER", "command_keyboard_by_peer", None))
         # Group chats: with require_mention on, the community answers only when addressed. Off by
         # default — it changes what the bot responds to, so it is opt-in like every other switch.
         self.require_mention = _truthy(extra, "VK_REQUIRE_MENTION", "require_mention", False)
@@ -463,6 +485,13 @@ class VKAdapter(BasePlatformAdapter):
             # Log anything unexpected: an unhandled update type used to be dropped in total silence,
             # which is indistinguishable from "the event never arrived" when debugging a button press.
             logger.info("VK: ignoring update type %s", kind or "<empty>")
+
+    def keyboard_for(self, chat_id: str) -> Optional[str]:
+        """Per-chat command keyboard; the rule itself lives in ``keyboard_for_peer`` (shared with cron)."""
+        return keyboard_for_peer(
+            {"command_keyboard": self.command_keyboard,
+             "command_keyboard_by_peer": self.command_keyboard_by_peer},
+            chat_id, fallback=self.command_keyboard)
 
     def _requires_mention(self, peer_id: int) -> bool:
         """Group gating: a per-chat override wins, otherwise the global flag."""
@@ -779,7 +808,7 @@ class VKAdapter(BasePlatformAdapter):
             try:
                 last_id = await self.client.send_message(
                     peer_id, text, reply_to=anchor if index == 0 else None, format_data=format_data,
-                    keyboard=command_keyboard() if self.command_keyboard else None)
+                    keyboard=self.keyboard_for(chat_id))
                 sent_any = True
             except VkApiError as exc:
                 # VK error 100 on messages.send usually means a malformed format_data/keyboard;
@@ -1089,15 +1118,15 @@ async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id: Op
     token = str(extra_or_secret(extra, "token", "VK_TOKEN", "") or "").strip()
     if not token:
         return send_error("VK standalone send: VK_TOKEN is not configured")
-    # Same keyboard as the live adapter: cron reports and `hermes send` land in the SAME chat, and a
-    # message without it may leave the client without the buttons the user enabled.
-    keyboard = command_keyboard() if _truthy(extra, "VK_COMMAND_KEYBOARD", "command_keyboard", False) else None
     client = VkClient(token, api_version=str(extra.get("api_version") or DEFAULT_API_VERSION))
     try:
         try:
             peer_id = int(chat_id)
         except (TypeError, ValueError):
             return send_error(f"VK standalone send: invalid peer id {chat_id!r}")
+        # Same keyboard as the live adapter: cron reports and `hermes send` land in the SAME chat, and a
+        # message without it may leave the client without the buttons the operator enabled for it.
+        keyboard = keyboard_for_peer(extra, chat_id)
         await client.resolve_group()
         chunks = render_chunks(message or "", VKAdapter.MAX_MESSAGE_LENGTH)
         # The host passes ``(path, is_voice)`` tuples (BasePlatformAdapter.filter_media_delivery_paths);

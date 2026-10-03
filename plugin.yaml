@@ -35,6 +35,10 @@ optional_env:
     description: "Показывать клавиатуру с командами (/help, /status, /new, /stop): тап отправляет команду"
     prompt: "Show a command keyboard? (true/false)"
     password: false
+  - name: VK_COMMAND_KEYBOARD_BY_PEER
+    description: "Переопределить клавиатуру для конкретных чатов: «peer_id:true,peer_id:false» (остальные наследуют общий флаг)"
+    prompt: "Per-chat keyboard overrides"
+    password: false
   - name: VK_QUOTE_IN_GROUPS
     description: "Цитировать входящее сообщение при ответе в беседе (по умолчанию true)"
     prompt: "Quote in group chats? (true/false)"

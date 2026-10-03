@@ -1409,6 +1409,70 @@ def test_standalone_send_skips_a_missing_file_and_keeps_the_report(monkeypatch, 
     assert calls[0][1] == "отчёт" and calls[0][2]["attachment"] == "doc-777_9"
 
 
+# ── клавиатура команд по чатам ───────────────────────────────────────────────
+
+def test_command_keyboard_is_decided_per_chat():
+    """A global flag plus a per-chat map: a chat's own entry wins in BOTH directions, an unlisted chat
+    inherits the global value — otherwise the setting would work for exactly one chat."""
+    adapter = make_adapter({"command_keyboard": True, "command_keyboard_by_peer": {"123456": False}})
+    assert adapter.keyboard_for("123456") is None                # этот чат себе отключил
+    assert adapter.keyboard_for("777777") == command_keyboard()  # остальные наследуют общий флаг
+
+    opted_in = make_adapter({"command_keyboard": False, "command_keyboard_by_peer": {"123456": True}})
+    assert opted_in.keyboard_for("123456") == command_keyboard()
+    assert opted_in.keyboard_for("777777") is None
+
+    assert make_adapter().keyboard_for("123456") is None         # по умолчанию выключено у всех
+
+
+def test_send_attaches_the_keyboard_only_for_the_chats_that_want_it():
+    """The decision must reach the wire: the per-chat map is worthless if send() still uses the global."""
+    adapter = make_adapter({"command_keyboard": True, "command_keyboard_by_peer": {str(GROUP_PEER): False}})
+    with open_loop() as loop:
+        loop.run_until_complete(adapter.send(str(GROUP_PEER), "без кнопок"))
+        loop.run_until_complete(adapter.send("123456", "с кнопками"))
+    without, with_keyboard = adapter.client.sent
+    assert without["keyboard"] is None
+    assert with_keyboard["keyboard"] == command_keyboard()
+
+
+def test_standalone_send_honours_the_per_chat_keyboard_map(monkeypatch):
+    """The cron path must reach the same decision as the live one: the buttons a chat enabled have to
+    ride on scheduled reports too, or the two paths disagree and nobody notices."""
+    import vk.adapter as mod
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            self.sent: list = []
+
+        async def resolve_group(self):
+            return (777, "Тест")
+
+        async def send_message(self, peer_id, message, **kwargs):
+            self.sent.append(kwargs)
+            return 1
+
+        async def close(self):
+            return None
+
+    holder: dict = {"clients": []}
+
+    def _factory(*args, **kwargs):
+        # Each call builds its own client (that is the point of the standalone sender), so both are kept.
+        client = _Client()
+        holder["clients"].append(client)
+        return client
+
+    monkeypatch.setattr(mod, "VkClient", _factory)
+    monkeypatch.setattr(mod, "extra_or_secret", lambda extra, key, env, default="": "vk1.a.TOKEN")
+    extra = {"command_keyboard": True, "command_keyboard_by_peer": {"123456": False}}
+    with open_loop() as loop:
+        loop.run_until_complete(mod._standalone_send(SimpleNamespace(extra=extra), "123456", "отчёт"))
+        loop.run_until_complete(mod._standalone_send(SimpleNamespace(extra=extra), "777777", "отчёт"))
+    off, on = holder["clients"]
+    assert off.sent[0]["keyboard"] is None and on.sent[0]["keyboard"] == command_keyboard()
+
+
 if __name__ == "__main__":
     tests = [(name, obj) for name, obj in sorted(globals().items())
              if name.startswith("test_") and callable(obj)]
