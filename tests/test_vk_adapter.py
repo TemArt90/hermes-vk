@@ -233,6 +233,10 @@ class FakeClient:
     async def set_activity(self, peer_id, activity="typing"):
         self.activity = (peer_id, activity)
 
+    async def download(self, url, **kwargs):
+        # inbound media: any bytes are fine, the cache write is stubbed per test
+        return b"\x89PNG\r\n\x1a\n" + b"0" * 16
+
 
 def make_adapter(extra=None) -> VKAdapter:
     from gateway.config import Platform
@@ -511,9 +515,12 @@ def test_slash_command_text_stays_bare_while_chat_keeps_the_note():
     """A command sent with an attachment must arrive as the bare command.
 
     Notes about attachments/geo/forwards share the message text so the agent sees what arrived; for a
-    slash command that would turn ``/new`` into ``/new\\n[геопозиция]`` and hand the note to the
-    command handler as its argument (session name, title, save target …).
+    slash command that would turn ``/new`` into ``/new\\n[фото]`` and hand the note to the command
+    handler as its argument (session name for /new, title for /title, target for /save …). All three
+    note sources are covered, plus the chat case that must keep its note.
     """
+    import vk.adapter as adapter_mod
+
     adapter = make_adapter()
     captured = []
 
@@ -521,13 +528,30 @@ def test_slash_command_text_stays_bare_while_chat_keeps_the_note():
         captured.append(event)
 
     adapter.handle_message = capture
-    common = {"date": 1_700_000_000, "peer_id": 123456, "from_id": 123456, "out": 0,
-              "attachments": [], "geo": {"coordinates": {"latitude": 0.0, "longitude": 0.0}}}
-    with open_loop() as loop:
-        loop.run_until_complete(adapter._handle_inbound({**common, "id": 900, "text": "/new"}, update_id="c1"))
-        loop.run_until_complete(adapter._handle_inbound({**common, "id": 901, "text": "привет"}, update_id="c2"))
-    assert captured[0].text == "/new", captured[0].text
-    assert captured[1].text == "привет\n[геопозиция]", captured[1].text
+    base = {"date": 1_700_000_000, "peer_id": 123456, "from_id": 123456, "out": 0}
+
+    def post(message_id, text, **extra):
+        with open_loop() as loop:
+            loop.run_until_complete(adapter._handle_inbound(
+                {**base, "id": message_id, "text": text, **extra}, update_id=f"c{message_id}"))
+        return captured[-1]
+
+    geo = {"geo": {"coordinates": {"latitude": 0.0, "longitude": 0.0}}}
+    photo = {"attachments": [{"type": "photo",
+                              "photo": {"sizes": [{"width": 10, "height": 10, "url": "http://x/1.jpg"}]}}]}
+
+    assert post(901, "/new", **geo).text == "/new"
+    assert post(902, "/help", fwd_messages=[{"id": 1}]).text == "/help"
+    assert post(903, "привет", **geo).text == "привет\n[геопозиция]"  # chat keeps its note
+
+    original = adapter_mod.cache_image_from_bytes
+    adapter_mod.cache_image_from_bytes = lambda data, ext=".jpg": "/cache/stub.jpg"
+    try:
+        event = post(904, "/new", **photo)
+    finally:
+        adapter_mod.cache_image_from_bytes = original
+    assert event.text == "/new", event.text
+    assert event.media_urls == ["/cache/stub.jpg"], event.media_urls  # the file itself still travels
 
 
 if __name__ == "__main__":
