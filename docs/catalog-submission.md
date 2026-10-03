@@ -28,8 +28,8 @@
 name: hermes-vk
 title: VK (ВКонтакте) channel
 repo: https://github.com/TemArt90/hermes-vk
-sha: f2f542a1fe5167640fdada9a1dc259a62379f88f
-version: "1.8.1"
+sha: c4b67264f3c3acd7df8d77e3339326b12b35bc12
+version: "1.8.2"
 requires_hermes: ">=0.21.3"
 description: >-
   VK (ВКонтакте) community channel for Hermes Agent: inbound over the Bots Long Poll API (no public URL,
@@ -59,7 +59,7 @@ description: >-
 maintainer: TemArt90
 tier: community
 category: platform
-docs_url: https://github.com/TemArt90/hermes-vk/blob/f2f542a1fe5167640fdada9a1dc259a62379f88f/README.md
+docs_url: https://github.com/TemArt90/hermes-vk/blob/c4b67264f3c3acd7df8d77e3339326b12b35bc12/README.md
 platforms: []
 capabilities:
   provides_tools: []
@@ -75,7 +75,7 @@ capabilities:
 
 Adds `plugin-catalog/hermes-vk.yaml` for **[hermes-vk](https://github.com/TemArt90/hermes-vk)** — a VK (ВКонтакте) community channel for Hermes Agent. I own that repository (`TemArt90`), per the owner-submitted rule.
 
-Pinned to the `v1.8.1` **release commit**: `f2f542a1fe5167640fdada9a1dc259a62379f88f` (annotated tag `v1.8.1`; the pin is the commit it points at, not the tag object, and it carries the same version string as the plugin manifest).
+Pinned to the `v1.8.2` **release commit**: `c4b67264f3c3acd7df8d77e3339326b12b35bc12` (annotated tag `v1.8.2`; the pin is the commit it points at, not the tag object, and it carries the same version string as the plugin manifest).
 
 ## Why a second VK entry (there is already `vk-platform`)
 
