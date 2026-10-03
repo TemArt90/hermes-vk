@@ -13,7 +13,9 @@ import asyncio
 import contextlib
 import json
 import os
+import pathlib
 import re
+import shutil
 import sys
 import traceback
 from types import SimpleNamespace
@@ -1043,6 +1045,53 @@ def test_photo_upload_keeps_working_without_a_peer():
             adapter._upload_bytes(b"\x89PNG!", "x.jpg", kind="photo", chat_id="13580122"))
     assert adapter.client.photo_uploads == [("x.jpg", 5)]
     assert adapter.client.doc_uploads == []
+
+
+def test_ffmpeg_is_found_in_the_bundled_tools_when_it_is_not_on_path():
+    """The gateway service PATH holds no ffmpeg; a which-only lookup silently broke voice transcoding."""
+    import tempfile as _tempfile
+    import vk.adapter as adapter_mod
+
+    root = pathlib.Path(_tempfile.mkdtemp(prefix="hermes-verify-ffmpeg-"))
+    try:
+        binary = root / "tools" / "ffmpeg-9.0.1-linux-x64" / "bin" / "ffmpeg"
+        binary.parent.mkdir(parents=True)
+        binary.write_text("#!/bin/sh\n", encoding="utf-8")
+        binary.chmod(0o755)
+        saved_home = os.environ.get("HERMES_HOME")
+        saved_which = adapter_mod.shutil.which
+        os.environ["HERMES_HOME"] = str(root)
+        adapter_mod.shutil.which = lambda name: None
+        try:
+            assert adapter_mod._find_ffmpeg() == str(binary)
+        finally:
+            adapter_mod.shutil.which = saved_which
+            if saved_home is None:
+                os.environ.pop("HERMES_HOME", None)
+            else:
+                os.environ["HERMES_HOME"] = saved_home
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_ffmpeg_is_absent_when_neither_path_nor_tools_has_it():
+    import tempfile as _tempfile
+    import vk.adapter as adapter_mod
+
+    root = pathlib.Path(_tempfile.mkdtemp(prefix="hermes-verify-ffmpeg-"))
+    saved_home = os.environ.get("HERMES_HOME")
+    saved_which = adapter_mod.shutil.which
+    os.environ["HERMES_HOME"] = str(root)
+    adapter_mod.shutil.which = lambda name: None
+    try:
+        assert adapter_mod._find_ffmpeg() is None
+    finally:
+        adapter_mod.shutil.which = saved_which
+        if saved_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = saved_home
+        shutil.rmtree(root, ignore_errors=True)
 
 
 if __name__ == "__main__":

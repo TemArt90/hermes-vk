@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime
+import glob
 import json
 import logging
 import mimetypes
@@ -203,10 +204,29 @@ def _keyboard(rows: List[List[Tuple[str, Optional[Dict[str, Any]], str]]]) -> Op
     return json.dumps({"inline": True, "buttons": buttons}, ensure_ascii=False) if buttons else None
 
 
+def _find_ffmpeg() -> Optional[str]:
+    """ffmpeg for voice transcoding: ``PATH`` first, then the copy Hermes bundles under ``tools/``.
+
+    The gateway runs as a service whose PATH holds neither — a ``shutil.which``-only lookup returned
+    None, so every voice message was sent unconverted (and, for anything not already Ogg Opus, landed
+    as a plain file instead of a voice bubble).
+    """
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    hermes_home = os.environ.get("HERMES_HOME") or os.path.join(os.path.expanduser("~"), ".hermes")
+    for candidate in sorted(glob.glob(os.path.join(hermes_home, "tools", "ffmpeg-*", "bin", "ffmpeg")),
+                            reverse=True):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 async def _voice_to_ogg_opus(data: bytes, *, max_seconds: int = VOICE_MAX_SECONDS) -> bytes:
     """VK voice messages must be Ogg Opus; transcode with ffmpeg when it is available."""
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = _find_ffmpeg()
     if not ffmpeg:
+        logger.info("VK: ffmpeg not found — the voice message is sent uncompressed (VK may reject it)")
         return data
     tmpdir = tempfile.mkdtemp(prefix="vk-voice-")
     try:
