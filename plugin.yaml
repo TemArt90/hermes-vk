@@ -1,7 +1,7 @@
 name: vk-platform
 label: VK
 kind: platform
-version: 1.8.4
+version: 1.9.0
 description: >
   VK (ВКонтакте) gateway adapter for Hermes Agent.
   Connects Hermes to a VK community bot through the Bots Long Poll API —
@@ -50,6 +50,10 @@ optional_env:
   - name: VK_FALLBACK_POLL_BATCH_SIZE
     description: "Сколько бесед просматривать за один проход (по умолчанию 20)"
     prompt: "Fallback poll batch size"
+    password: false
+  - name: VK_DEDUPE_TTL_SECONDS
+    description: "Окно дедупликации входящих апдейтов, секунды (по умолчанию 900; значения меньше 30 игнорируются)"
+    prompt: "Dedupe window (seconds)"
     password: false
   - name: VK_QUOTE_IN_GROUPS
     description: "Цитировать входящее сообщение при ответе в беседе (по умолчанию true)"

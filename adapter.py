@@ -68,6 +68,10 @@ TRANSPORT_SILENCE_SECONDS = 150.0
 # a net under the primary path, never a second path — a healthy Long Poll must see no traffic from it.
 FALLBACK_POLL_INTERVAL = 60      # seconds between sweeps
 FALLBACK_POLL_BATCH = 20         # conversations examined per sweep
+# Deduplication window for inbound update ids. VK replays buffered updates for ~5 minutes after a
+# hiccup, so a window shorter than that trades away protection and buys nothing.
+DEFAULT_DEDUPE_TTL_SECONDS = 900
+MIN_DEDUPE_TTL_SECONDS = 30
 MAX_BUTTON_LABEL = 40
 MAX_CALLBACK_PAYLOAD = 250
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
@@ -123,6 +127,21 @@ def _reaction_id(raw: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return value if value >= 0 else default
+
+
+def _dedupe_ttl(raw: Any) -> int:
+    """The deduplication window in seconds; junk or too-small values fall back to the default.
+
+    Deliberately NOT "0 disables deduplication" (the semantics the sibling VK plugin gives this knob): an
+    operator reaching for 0 almost always wants "back to defaults", and reading it as "turn protection
+    off" would let the channel answer the same redelivered message twice. To genuinely disable dedupe,
+    pass 0 through ``extra``/``.env`` and it is ignored the same way — there is no silent switch for it.
+    """
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_DEDUPE_TTL_SECONDS
+    return value if value >= MIN_DEDUPE_TTL_SECONDS else DEFAULT_DEDUPE_TTL_SECONDS
 
 
 def _vk_mention_patterns(group_id: int, group_name: str) -> List[str]:
@@ -322,7 +341,9 @@ class VKAdapter(BasePlatformAdapter):
         self._delete_reaction_supported: Optional[bool] = None
         self.client: Optional[VkClient] = None
         self._poll_task: Optional[asyncio.Task] = None
-        self._dedup = MessageDeduplicator(ttl_seconds=900)
+        self.dedupe_ttl_seconds = _dedupe_ttl(
+            _env(extra, "VK_DEDUPE_TTL_SECONDS", "dedupe_ttl_seconds", None))
+        self._dedup = MessageDeduplicator(ttl_seconds=self.dedupe_ttl_seconds)
         self._last_inbound: Dict[str, str] = {}
         self._conn: Tuple[str, str, Any] = ("", "", 0)
         self._last_poll_ok = 0.0

@@ -1714,6 +1714,103 @@ def test_client_video_upload_fails_loudly_without_an_upload_url():
     assert caught is not None and "video_id" in caught.message
 
 
+# ── окно дедупликации (VK_DEDUPE_TTL_SECONDS) ────────────────────────────────
+
+def test_dedupe_window_defaults_to_900_seconds():
+    """VK replays buffered updates for ~5 minutes, so the default window covers a reconnect hiccup."""
+    assert make_adapter().dedupe_ttl_seconds == 900
+
+
+def test_dedupe_window_is_configurable_through_both_channels(monkeypatch):
+    """`extra` (config.yaml) and the env var both work, env wins — the plugin convention."""
+    assert make_adapter({"dedupe_ttl_seconds": 1800}).dedupe_ttl_seconds == 1800
+    monkeypatch.setenv("VK_DEDUPE_TTL_SECONDS", "2400")
+    assert make_adapter().dedupe_ttl_seconds == 2400
+    monkeypatch.setenv("VK_DEDUPE_TTL_SECONDS", "120")
+    assert make_adapter({"dedupe_ttl_seconds": 1800}).dedupe_ttl_seconds == 120
+
+
+def test_dedupe_window_ignores_zero_junk_and_negative_values():
+    """A `0` here must NOT silently switch deduplication off (the sibling plugin reads it that way): the
+    protection against answering a redelivered message twice is the entire point of the window."""
+    from vk.adapter import DEFAULT_DEDUPE_TTL_SECONDS, MIN_DEDUPE_TTL_SECONDS
+    for raw in ("0", "-5", "1", str(MIN_DEDUPE_TTL_SECONDS - 1), "abc", "", None):
+        assert make_adapter({"dedupe_ttl_seconds": raw}).dedupe_ttl_seconds == DEFAULT_DEDUPE_TTL_SECONDS
+    assert make_adapter({"dedupe_ttl_seconds": MIN_DEDUPE_TTL_SECONDS}).dedupe_ttl_seconds == MIN_DEDUPE_TTL_SECONDS
+
+
+def test_dedupe_window_of_zero_in_the_environment_keeps_the_default(monkeypatch):
+    monkeypatch.setenv("VK_DEDUPE_TTL_SECONDS", "0")
+    assert make_adapter().dedupe_ttl_seconds == 900
+
+
+def test_configured_window_reaches_the_deduplicator_itself():
+    """Asserting the attribute alone would pass while the deduplicator kept its own built-in default."""
+    adapter = make_adapter({"dedupe_ttl_seconds": 1200})
+    assert adapter._dedup._ttl == 1200
+
+
+# ── изоляция профилей: секреты только через scoped-читатель ──────────────────
+
+def test_token_never_comes_from_the_ambient_environment(monkeypatch):
+    """A second profile must not borrow the default profile's token. Credentials are read only through
+    `get_scoped_secret` (which resolves the ACTIVE profile's .env), so a bare VK_TOKEN in os.environ —
+    exactly what a multiplexed gateway process has lying around — must be invisible to the adapter."""
+    import vk.adapter as mod
+    monkeypatch.setenv("VK_TOKEN", "token-from-the-wrong-profile")
+    monkeypatch.setattr(mod, "get_scoped_secret", lambda name, default="": default)
+    assert make_adapter().token == ""
+
+
+def test_two_adapters_resolve_their_own_profiles_token(monkeypatch):
+    """The multiplexing contract in one test: same plugin class, two profiles, two different tokens."""
+    import vk.adapter as mod
+    active = {"profile": "default"}
+    tokens = {"default": "token-default", "independent": "token-independent"}
+    monkeypatch.setattr(mod, "get_scoped_secret",
+                        lambda name, default="": tokens[active["profile"]] if name == "VK_TOKEN" else default)
+    first = make_adapter()
+    active["profile"] = "independent"
+    second = make_adapter()
+    assert (first.token, second.token) == ("token-default", "token-independent")
+
+
+def test_a_profile_without_its_own_token_fails_closed(monkeypatch):
+    """Fail-closed, not fallback: no token in THIS profile means the platform probe is False, no cron
+    channel is seeded and the adapter cannot authenticate — never a neighbouring profile's secrets."""
+    import vk.adapter as mod
+    monkeypatch.setattr(mod, "get_scoped_secret", lambda name, default="": default)
+    assert mod.check_requirements() is False
+    assert mod.validate_config(SimpleNamespace(extra={})) is False
+    assert mod._env_enablement() is None
+    assert make_adapter().token == ""
+
+
+def test_credentials_are_never_read_from_os_environ():
+    """Catches the common literal form of the leak: `os.getenv("VK_…")` / `os.environ["VK_…"]` would work
+    for the default profile and then hand that value to every other one. This is a lint, not the guard —
+    a variable name (`os.environ.get(name)`) slips past it, which is exactly what the behavioural test
+    above catches (measured: mutating `_env` to read the environment first failed that test, not this one)."""
+    plugin_dir = pathlib.Path(__file__).resolve().parents[1]
+    patterns = ('os.getenv("VK_', "os.getenv('VK_", 'os.environ["VK_', "os.environ['VK_",
+                'os.environ.get("VK_', "os.environ.get('VK_")
+    offenders = [f"{name}: {pattern}" for name in ("adapter.py", "vk_api.py", "vk_markdown.py")
+                 for pattern in patterns if pattern in (plugin_dir / name).read_text(encoding="utf-8")]
+    assert offenders == []
+
+
+def test_adapter_construction_does_not_write_credentials_into_the_environment(monkeypatch):
+    """Two profiles share one process: a plugin that exports its token into os.environ hands it to the
+    next profile, and that leak is invisible until the wrong community answers."""
+    import vk.adapter as mod
+    monkeypatch.setattr(mod, "get_scoped_secret",
+                        lambda name, default="": "token-x" if name == "VK_TOKEN" else default)
+    before = {name: value for name, value in os.environ.items() if name.startswith("VK_")}
+    make_adapter()
+    make_adapter()
+    assert {name: value for name, value in os.environ.items() if name.startswith("VK_")} == before
+
+
 class _MiniMonkeypatch:
     """The slice of pytest's ``monkeypatch`` the standalone runner needs, with the same undo semantics.
 
