@@ -47,7 +47,10 @@ description: >-
   (VK_COMMAND_KEYBOARD_BY_PEER), and an opt-in fallback sweep polls the newest conversations when Long
   Poll has been silent for a whole interval (VK_FALLBACK_POLL_ENABLED, _INTERVAL_SECONDS, _BATCH_SIZE),
   feeding the same handler through the same deduplicator. Videos are attempted as native VK video and
-  fall back to a document. Operator documentation ships in docs/ (development, troubleshooting,
+  fall back to a document; an OPTIONAL personal user token (VK_USER_TOKEN) is what makes
+  video.get/video.save possible at all (a community token is refused with error 5) — it is used only
+  for those two calls, is never seeded into platform config, and every error is redacted before it can
+  reach a log. Operator documentation ships in docs/ (development, troubleshooting,
   update-guide, vk-api-notes). An optional persistent command keyboard (VK_COMMAND_KEYBOARD=true) puts
   /help, /status, /new and /stop under the input field, since VK has no command-list API for community
   bots. Disclosure — the community access token is read from the Hermes profile .env (VK_TOKEN) and sent
