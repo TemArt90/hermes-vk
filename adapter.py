@@ -957,13 +957,16 @@ class VKAdapter(BasePlatformAdapter):
 
     # ------------------------------------------------------------------ outbound media
 
-    async def _upload_bytes(self, data: bytes, filename: str, *, kind: str) -> str:
+    async def _upload_bytes(self, data: bytes, filename: str, *, kind: str, chat_id: str) -> str:
         if self.client is None:
             raise RuntimeError("not connected")
         if len(data) > MAX_UPLOAD_BYTES:
             raise ValueError(f"{filename} is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
-        return await (self.client.upload_photo(data, filename) if kind == "photo"
-                      else self.client.upload_document(data, filename, kind=kind))
+        if kind == "photo":
+            return await self.client.upload_photo(data, filename)
+        # Documents and voice messages need the conversation peer: VK rejects peer_id=0 there
+        # ("peer_id is invalid"), which silently broke every file and voice send.
+        return await self.client.upload_document(data, filename, kind=kind, peer_id=int(chat_id))
 
     async def _send_attachment(self, chat_id: str, source: str, *, kind: str, caption: Optional[str] = None,
                                filename: Optional[str] = None, reply_to: Optional[str] = None,
@@ -985,7 +988,7 @@ class VKAdapter(BasePlatformAdapter):
             if kind == "voice":
                 data = await self._to_ogg_opus(data)
                 name = (os.path.splitext(name)[0] or "voice") + ".ogg"
-            attachment = await self._upload_bytes(data, name, kind=upload_kind)
+            attachment = await self._upload_bytes(data, name, kind=upload_kind, chat_id=chat_id)
         except Exception as exc:
             logger.warning("VK: %s upload failed: %s", kind, exc)
             return SendResult(success=False, error=str(exc), error_kind="unknown", retryable=True)
@@ -1098,11 +1101,11 @@ async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id: Op
             if is_voice:
                 data = await _voice_to_ogg_opus(data)
                 name = (os.path.splitext(name)[0] or "voice") + ".ogg"
-                attachment = await client.upload_document(data, name, kind="audio_message")
+                attachment = await client.upload_document(data, name, kind="audio_message", peer_id=peer_id)
             elif not force_document and (mimetypes.guess_type(path)[0] or "").startswith("image/"):
                 attachment = await client.upload_photo(data, name)
             else:
-                attachment = await client.upload_document(data, name)
+                attachment = await client.upload_document(data, name, peer_id=peer_id)
             caption, caption_fmt = pairing if (pairing and index == 0) else ("", None)
             last_id = await client.send_message(
                 peer_id, caption, format_data=caption_fmt, attachment=attachment, keyboard=keyboard)

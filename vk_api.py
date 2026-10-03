@@ -226,9 +226,15 @@ class VkClient:
         photo = saved[0]
         return f"photo{photo['owner_id']}_{photo['id']}"
 
-    async def upload_document(self, data: bytes, filename: str, *, kind: str = "doc") -> str:
-        """Upload a file (``doc``) or a voice message (``audio_message``, Ogg Opus only)."""
-        server = await self.call("docs.getMessagesUploadServer", type=kind, peer_id=0) or {}
+    async def upload_document(self, data: bytes, filename: str, *, kind: str = "doc",
+                              peer_id: int = 0) -> str:
+        """Upload a file (``doc``) or a voice message (``audio_message``, Ogg Opus only).
+
+        ``peer_id`` must be the real conversation peer here: unlike ``photos.getMessagesUploadServer``
+        (which accepts 0), VK answers ``docs.getMessagesUploadServer`` with error 100
+        "peer_id is invalid" for 0, so every document and voice message fails without it.
+        """
+        server = await self.call("docs.getMessagesUploadServer", type=kind, peer_id=peer_id) or {}
         upload = await self._upload(server["upload_url"], data, filename)
         if not upload.get("file"):
             raise VkApiError("docs.getMessagesUploadServer", 0,

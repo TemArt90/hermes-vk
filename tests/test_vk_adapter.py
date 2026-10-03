@@ -219,8 +219,18 @@ class FakeClient:
         self.edits = []
         self.reactions = []
         self.reaction_deletes = []
+        self.doc_uploads = []
+        self.photo_uploads = []
         self.group_id = -777
         self.group_name = "Тестовое сообщество"
+
+    async def upload_photo(self, data, filename="image.jpg"):
+        self.photo_uploads.append((filename, len(data)))
+        return "photo-777_1"
+
+    async def upload_document(self, data, filename, kind="doc", **kwargs):
+        self.doc_uploads.append((kwargs.get("peer_id"), filename, kind))
+        return "doc-777_2"
 
     async def send_message(self, peer_id, message, **kwargs):
         self.sent.append({"peer_id": peer_id, "message": message, **kwargs})
@@ -453,7 +463,7 @@ def test_standalone_send_accepts_host_media_tuples():
             uploaded.append(("photo", os.path.basename(filename), len(data)))
             return "photo-777_1"
 
-        async def upload_document(self, data, filename, kind="doc"):
+        async def upload_document(self, data, filename, kind="doc", peer_id=None):
             uploaded.append((kind, os.path.basename(filename), len(data)))
             return "doc-777_2"
 
@@ -1003,6 +1013,36 @@ def test_missing_delete_reaction_is_remembered_not_retried():
         loop.run_until_complete(adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED))
     assert calls["n"] == 1                     # the second call is skipped, not retried
     assert adapter._delete_reaction_supported is False
+
+
+def test_document_upload_carries_the_conversation_peer():
+    """VK answers ``docs.getMessagesUploadServer`` with ``peer_id is invalid`` for 0.
+
+    Found in the gateway log, not in a test: every document and voice message had been failing.
+    """
+    adapter = make_adapter()
+    with open_loop() as loop:
+        loop.run_until_complete(
+            adapter._upload_bytes(b"%PDF-1.4 test", "док.pdf", kind="doc", chat_id="13580122"))
+    assert adapter.client.doc_uploads == [(13580122, "док.pdf", "doc")]
+
+
+def test_voice_upload_uses_the_same_peer_scoped_server():
+    adapter = make_adapter()
+    with open_loop() as loop:
+        loop.run_until_complete(
+            adapter._upload_bytes(b"OggS", "voice.ogg", kind="audio_message", chat_id="13580122"))
+    assert adapter.client.doc_uploads == [(13580122, "voice.ogg", "audio_message")]
+
+
+def test_photo_upload_keeps_working_without_a_peer():
+    """The asymmetry is VK's: ``photos.getMessagesUploadServer`` accepts 0, the docs endpoint doesn't."""
+    adapter = make_adapter()
+    with open_loop() as loop:
+        loop.run_until_complete(
+            adapter._upload_bytes(b"\x89PNG!", "x.jpg", kind="photo", chat_id="13580122"))
+    assert adapter.client.photo_uploads == [("x.jpg", 5)]
+    assert adapter.client.doc_uploads == []
 
 
 if __name__ == "__main__":
