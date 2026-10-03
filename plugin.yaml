@@ -1,7 +1,7 @@
 name: vk-platform
 label: VK
 kind: platform
-version: 1.1.0
+version: 1.2.0
 description: >
   VK (ВКонтакте) gateway adapter for Hermes Agent.
   Connects Hermes to a VK community bot through the Bots Long Poll API —
@@ -42,4 +42,24 @@ optional_env:
   - name: VK_API_VERSION
     description: "Версия VK API (по умолчанию 5.199)"
     prompt: "API version"
+    password: false
+  - name: VK_REQUIRE_MENTION
+    description: "В беседах отвечать только когда бота упомянули (по умолчанию false — отвечает на все сообщения)"
+    prompt: "Require a mention in group chats? (true/false)"
+    password: false
+  - name: VK_REQUIRE_MENTION_BY_PEER
+    description: "Переопределить упоминание для конкретных бесед: «peer_id:true,peer_id:false» (остальные наследуют общий флаг)"
+    prompt: "Per-chat mention overrides"
+    password: false
+  - name: VK_MENTION_PATTERNS
+    description: "Свои шаблоны упоминания (через запятую) вместо автоматических: по id сообщества и его имени"
+    prompt: "Custom mention patterns"
+    password: false
+  - name: VK_DOWNLOAD_ATTACHMENTS
+    description: "Скачивать вложения из чата в кэш агента (по умолчанию true). Выключите, если бот не должен принимать файлы"
+    prompt: "Download inbound attachments? (true/false)"
+    password: false
+  - name: VK_MAX_ATTACHMENT_BYTES
+    description: "Предел размера скачиваемого вложения в байтах (по умолчанию 20971520 = 20 МБ)"
+    prompt: "Max inbound attachment size in bytes"
     password: false

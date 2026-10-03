@@ -14,6 +14,14 @@ on:
 jobs:
   pytest:
     runs-on: ubuntu-24.04   # pinned: `latest` migrates to Ubuntu 26 in Oct 2026
+    strategy:
+      fail-fast: false
+      matrix:
+        # Two Hermes revisions side by side: current main and the oldest release the plugin claims
+        # to support (v2026.9.14 is 0.21.3). A change that reaches for a newer internal API then
+        # fails here instead of on a user's install — and the `requires_hermes` floor in the plugin
+        # catalogue entry stays a measured fact rather than a guess.
+        hermes_ref: [main, v2026.9.14]
     env:
       # tests/_paths.py resolves the Hermes runtime from here
       HERMES_INSTALL: ${{ github.workspace }}/.ci-hermes
@@ -24,8 +32,8 @@ jobs:
         with:
           python-version: "3.11"   # the interpreter the plugin is developed against
 
-      - name: Clone the Hermes runtime (public repository)
-        run: git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$HERMES_INSTALL"
+      - name: Clone the Hermes runtime (${{ matrix.hermes_ref }})
+        run: git clone --depth 1 --branch "${{ matrix.hermes_ref }}" https://github.com/NousResearch/hermes-agent.git "$HERMES_INSTALL"
 
       - name: Install test dependencies
         # Hermes' own dependency set is not pulled by a plain checkout, so the CI carries the slice the

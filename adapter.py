@@ -36,6 +36,7 @@ import logging
 import mimetypes
 import os
 import random
+import re
 import shutil
 import tempfile
 import time
@@ -51,7 +52,7 @@ from gateway.platforms.base import (
     cache_audio_from_bytes, cache_document_from_bytes, cache_image_from_bytes,
 )
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.platforms.helpers import MessageDeduplicator, cancel_task
+from gateway.platforms.helpers import MessageDeduplicator, cancel_task, compile_mention_patterns
 
 from .vk_api import DEFAULT_API_VERSION, VkApiError, VkClient
 from .vk_markdown import render_chunks, to_plain
@@ -65,9 +66,59 @@ TRANSPORT_SILENCE_SECONDS = 150.0
 MAX_BUTTON_LABEL = 40
 MAX_CALLBACK_PAYLOAD = 250
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+# Inbound media cap. A document or an audio message can exceed it; photos and voice notes do not.
+DEFAULT_MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 VOICE_MAX_SECONDS = 300
 # Update types that are expected noise for a bot (never worth a log line when enabled).
 _QUIET_UPDATE_TYPES = frozenset({"message_typing_state", "message_read", "message_allow", "message_deny"})
+
+
+def _peer_bool_map(raw: Any) -> Dict[int, bool]:
+    """Parse per-chat booleans: a ``{peer: bool}`` map (config) or ``"peer:true,peer:false"`` (env).
+
+    Anything unparsable is dropped rather than defaulted, so a typo cannot silently flip a chat's
+    policy — an unlisted chat always inherits the global setting.
+    """
+    pairs: List[Tuple[Any, Any]] = []
+    if isinstance(raw, dict):
+        pairs = list(raw.items())
+    elif isinstance(raw, str):
+        for part in raw.split(","):
+            if ":" in part:
+                key, _, value = part.partition(":")
+                pairs.append((key, value))
+    out: Dict[int, bool] = {}
+    for key, value in pairs:
+        try:
+            peer = int(str(key).strip())
+        except (TypeError, ValueError):
+            continue
+        if isinstance(value, bool):  # a real boolean keeps its own value, unlike the string "false"
+            out[peer] = value
+            continue
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            out[peer] = True
+        elif text in {"0", "false", "no", "off"}:
+            out[peer] = False
+    return out
+
+
+def _vk_mention_patterns(group_id: int, group_name: str) -> List[str]:
+    """Wake-word patterns for one community: its link-mention, ``@club<id>`` and its plain name.
+
+    VK writes a community mention as ``[club<id>|<name>]`` inside the message text, so the id forms
+    are exact. The plain name is a convenience for people who type it; a name shorter than three
+    characters is skipped, because it would match unrelated words.
+    """
+    patterns: List[str] = []
+    if group_id:
+        patterns.append(rf"\[club{int(group_id)}\|[^\]]*\]")
+        patterns.append(rf"(?<![\w@])@club{int(group_id)}\b")
+    name = (group_name or "").strip()
+    if len(name) >= 3:
+        patterns.append(rf"(?<![\w@])@?{re.escape(name)}\b")
+    return patterns
 
 
 def _is_group(peer_id: int) -> bool:
@@ -181,6 +232,21 @@ class VKAdapter(BasePlatformAdapter):
         self.quote_in_groups = _truthy(extra, "VK_QUOTE_IN_GROUPS", "quote_in_groups", True)
         # Off by default: a persistent keyboard occupies space above the input field.
         self.command_keyboard = _truthy(extra, "VK_COMMAND_KEYBOARD", "command_keyboard", False)
+        # Group chats: with require_mention on, the community answers only when addressed. Off by
+        # default — it changes what the bot responds to, so it is opt-in like every other switch.
+        self.require_mention = _truthy(extra, "VK_REQUIRE_MENTION", "require_mention", False)
+        self.require_mention_by_peer = _peer_bool_map(
+            _env(extra, "VK_REQUIRE_MENTION_BY_PEER", "require_mention_by_peer", None))
+        self.mention_patterns_raw = _env(extra, "VK_MENTION_PATTERNS", "mention_patterns", None)
+        # Inbound media: the download itself can be switched off, and its cap is per install.
+        self.download_attachments = _truthy(extra, "VK_DOWNLOAD_ATTACHMENTS", "download_attachments", True)
+        try:
+            self.max_attachment_bytes = int(
+                _env(extra, "VK_MAX_ATTACHMENT_BYTES", "max_attachment_bytes", DEFAULT_MAX_ATTACHMENT_BYTES)
+                or DEFAULT_MAX_ATTACHMENT_BYTES)
+        except (TypeError, ValueError):
+            self.max_attachment_bytes = DEFAULT_MAX_ATTACHMENT_BYTES
+        self._mention_patterns: List[Any] = []
         self.client: Optional[VkClient] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._dedup = MessageDeduplicator(ttl_seconds=900)
@@ -215,6 +281,10 @@ class VKAdapter(BasePlatformAdapter):
         except Exception as exc:  # network
             self._set_fatal_error("connect_failed", f"VK unreachable: {exc}", retryable=True)
             return False
+        # Mention recognition needs the community's id and name, which exist only after resolve_group().
+        self._mention_patterns = compile_mention_patterns(
+            self.mention_patterns_raw, log_prefix="vk",
+            defaults=_vk_mention_patterns(self.client.group_id, self.client.group_name))
         try:
             self._conn = await self._acquire_long_poll()
         except Exception as exc:
@@ -347,6 +417,21 @@ class VKAdapter(BasePlatformAdapter):
             # which is indistinguishable from "the event never arrived" when debugging a button press.
             logger.info("VK: ignoring update type %s", kind or "<empty>")
 
+    def _requires_mention(self, peer_id: int) -> bool:
+        """Group gating: a per-chat override wins, otherwise the global flag."""
+        return self.require_mention_by_peer.get(int(peer_id), self.require_mention)
+
+    def _mentions_bot(self, text: str) -> bool:
+        return bool(text) and any(pattern.search(text) for pattern in self._mention_patterns)
+
+    def _strip_mention(self, text: str) -> str:
+        """Drop the mention so the agent sees the actual request, not the addressing of the bot."""
+        for pattern in self._mention_patterns:
+            if pattern.search(text):
+                trimmed = pattern.sub("", text, count=1).strip(" ,:;—-—\t")
+                return trimmed or text
+        return text
+
     async def _handle_inbound(self, message: Dict[str, Any], *, update_id: str = "") -> None:
         if not isinstance(message, dict):
             return
@@ -368,6 +453,13 @@ class VKAdapter(BasePlatformAdapter):
                 self._last_inbound.pop(next(iter(self._last_inbound)))
 
         text = (message.get("text") or "").strip()
+        if is_group and self._requires_mention(peer_id):
+            # Gate BEFORE the downloads below: an unmentioned group message must not pull every
+            # attachment through the API only to be dropped.
+            if not self._mentions_bot(text):
+                logger.debug("VK: ignoring group message (require_mention, not addressed): peer=%s", peer_id)
+                return
+            text = self._strip_mention(text)
         media_urls: List[str] = []
         media_types: List[str] = []
         notes: List[str] = []
@@ -408,6 +500,16 @@ class VKAdapter(BasePlatformAdapter):
         )
         await self.handle_message(event)
 
+    async def _download_attachment(self, url: str) -> Optional[bytes]:
+        """Fetch one inbound attachment, honouring the size cap; ``None`` when downloads are off.
+
+        One place decides whether inbound media is fetched at all, so the switch cannot drift apart
+        between the photo, document and voice paths.
+        """
+        if not self.download_attachments or self.client is None:
+            return None
+        return await self.client.download(url, max_bytes=self.max_attachment_bytes)
+
     async def _collect_attachments(
         self, attachments: List[Dict[str, Any]], media_urls: List[str], media_types: List[str], notes: List[str],
     ) -> None:
@@ -421,22 +523,22 @@ class VKAdapter(BasePlatformAdapter):
                 if kind == "photo":
                     sizes = body.get("sizes") or []
                     url = max(sizes, key=lambda s: int(s.get("width") or 0)).get("url") if sizes else None
-                    if url:
-                        data = await self.client.download(url)
+                    data = await self._download_attachment(url) if url else None
+                    if data is not None:
                         media_urls.append(cache_image_from_bytes(data, ".jpg"))
                         media_types.append("image/jpeg")
                     notes.append("[фото]")
                 elif kind == "doc":
                     url, title = body.get("url"), str(body.get("title") or "file")
-                    if url:
-                        data = await self.client.download(url)
+                    data = await self._download_attachment(url) if url else None
+                    if data is not None:
                         media_urls.append(cache_document_from_bytes(data, title))
                         media_types.append(mimetypes.guess_type(title)[0] or "application/octet-stream")
                     notes.append(f"[документ: {title}]")
                 elif kind == "audio_message":
                     url = body.get("link_ogg") or body.get("link_mp3")
-                    if url:
-                        data = await self.client.download(url)
+                    data = await self._download_attachment(url) if url else None
+                    if data is not None:
                         media_urls.append(cache_audio_from_bytes(data, ".ogg"))
                         media_types.append("audio/ogg")
                     notes.append(f"[голосовое сообщение, {int(body.get('duration') or 0)} с]")
@@ -684,12 +786,17 @@ class VKAdapter(BasePlatformAdapter):
         """Native Approve/Deny buttons; a press resolves via ``tools.approval``."""
         approval_id = uuid.uuid4().hex[:12]
         self._approval_state[approval_id] = prompt.session_key
-        rows = [[(label, {"v": "ea", "id": approval_id, "c": choice}, "positive" if choice != "deny" else "negative")]
-                for label, choice, _style in (prompt.actions or [])]
-        pairs: List[List[Tuple[str, Optional[Dict[str, Any]], str]]] = []
-        for index in range(0, len(rows), 2):
-            pairs.append(rows[index] + rows[index + 1: index + 2])
-        return await self._send_keyboard(prompt.chat_id, prompt.text, pairs, prompt.metadata)
+        # Two buttons per row; a lone trailing button is fine. The previous pairing wrapped the second
+        # row in a list (``rows[index + 1:index + 2]``), so the keyboard never built and an approval
+        # silently fell back to plain text — without buttons AND without the "/approve" instructions
+        # the core only adds when an adapter has no button support. Pinned by
+        # test_exec_approval_card_carries_every_choice_bound_to_one_prompt.
+        buttons = [
+            (label, {"v": "ea", "id": approval_id, "c": choice},
+             "negative" if choice == "deny" else "positive")
+            for label, choice, _style in (prompt.actions or [])]
+        rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+        return await self._send_keyboard(prompt.chat_id, prompt.text, rows, prompt.metadata)
 
     async def send_slash_confirm(self, chat_id: str, title: str, message: str, session_key: str,
                                  confirm_id: str, metadata: Optional[Dict[str, Any]] = None) -> SendResult:

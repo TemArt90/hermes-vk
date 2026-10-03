@@ -13,13 +13,16 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import sys
 import traceback
 from types import SimpleNamespace
 
 import _paths  # noqa: E402  (registers the plugin as `vk`, whatever this directory is called)
 
-from vk.adapter import VKAdapter, _is_group, _keyboard, command_keyboard  # noqa: E402
+from vk.adapter import (  # noqa: E402
+    VKAdapter, _is_group, _keyboard, _peer_bool_map, _vk_mention_patterns, command_keyboard,
+)
 from vk.vk_markdown import VK_SAFE_ITEM_TYPES, render_chunks, to_plain, u16_len  # noqa: E402
 
 
@@ -635,6 +638,216 @@ def test_standalone_send_attaches_command_keyboard_when_enabled():
             os.environ["VK_COMMAND_KEYBOARD"] = saved
     assert on["keyboard"] == command_keyboard()
     assert off.get("keyboard") is None
+
+
+# ── group gating: who the community answers in a chat ────────────────────────
+
+GROUP_PEER = 2_000_000_001  # VK spells a group chat as 2000000000 + chat_id
+GROUP_MSG = {
+    "id": 900, "date": 1_700_000_000, "peer_id": GROUP_PEER, "from_id": 123456,
+    "text": "привет", "out": 0, "attachments": [],
+}
+
+
+class RecordingClient(FakeClient):
+    """FakeClient that remembers every download and enforces the cap the way the real client does."""
+
+    def __init__(self, payload: bytes = b"\x89PNG\r\n\x1a\n"):
+        super().__init__()
+        self.payload = payload
+        self.downloads = []
+
+    async def download(self, url, *, max_bytes: int = 0, **kwargs):
+        self.downloads.append((url, max_bytes))
+        if max_bytes and len(self.payload) > max_bytes:
+            from vk.vk_api import VkApiError
+            raise VkApiError("download", 0, f"file exceeds {max_bytes} bytes")
+        return self.payload
+
+
+def with_mentions(adapter, group_id: int = 241965111, name: str = "Еремей"):
+    """Build the mention patterns exactly as connect() does once resolve_group() has answered."""
+    from gateway.platforms.helpers import compile_mention_patterns
+    adapter._mention_patterns = compile_mention_patterns(
+        adapter.mention_patterns_raw, log_prefix="vk", defaults=_vk_mention_patterns(group_id, name))
+    return adapter
+
+
+def capture_events(adapter):
+    seen = []
+
+    async def capture(event):
+        seen.append(event)
+
+    adapter.handle_message = capture
+    return seen
+
+
+def run_inbound(adapter, message, update_id: str = "evt"):
+    with open_loop() as loop:
+        loop.run_until_complete(adapter._handle_inbound(message, update_id=update_id))
+
+
+def _matches(patterns, text: str) -> bool:
+    return any(re.compile(pattern, re.IGNORECASE).search(text) for pattern in patterns)
+
+
+def test_peer_bool_map_parses_env_and_config_and_drops_typos():
+    assert _peer_bool_map("123:true,456:false,789:maybe,abc:true") == {123: True, 456: False}
+    assert _peer_bool_map({"1": "on", "2": "off"}) == {1: True, 2: False}
+    assert _peer_bool_map(None) == {}
+    assert _peer_bool_map("") == {}
+
+
+def test_mention_patterns_match_both_id_forms_and_the_community_name():
+    patterns = _vk_mention_patterns(241965111, "Еремей")
+    assert _matches(patterns, "[club241965111|Еремей] посчитай итоги")
+    assert _matches(patterns, "эй @club241965111, ты тут?")
+    assert _matches(patterns, "Еремей, посчитай")
+    assert not _matches(patterns, "просто сообщение про ремонт")
+    # A two-letter community name must not become a wake word: it would match unrelated words.
+    assert not _matches(_vk_mention_patterns(241965111, "Вк"), "вклад в банке")
+
+
+def test_group_message_is_silent_when_a_mention_is_required():
+    adapter = with_mentions(make_adapter({"require_mention": True}))
+    seen = capture_events(adapter)
+    run_inbound(adapter, GROUP_MSG, "g1")
+    assert seen == []
+
+
+def test_group_message_with_a_mention_is_answered_and_the_mention_is_stripped():
+    adapter = with_mentions(make_adapter({"require_mention": True}))
+    seen = capture_events(adapter)
+    run_inbound(adapter, {**GROUP_MSG, "text": "[club241965111|Еремей] посчитай итоги"}, "g2")
+    assert len(seen) == 1
+    assert seen[0].text == "посчитай итоги"
+
+
+def test_dm_is_never_mention_gated():
+    adapter = with_mentions(make_adapter({"require_mention": True}))
+    seen = capture_events(adapter)
+    run_inbound(adapter, {**GROUP_MSG, "peer_id": 123456, "from_id": 123456}, "g3")
+    assert len(seen) == 1  # a direct message is addressed to the bot by definition
+
+
+def test_group_still_answers_everything_when_the_gate_is_off():
+    """The default must not change: requiring a mention is strictly opt-in."""
+    adapter = with_mentions(make_adapter())
+    seen = capture_events(adapter)
+    run_inbound(adapter, {**GROUP_MSG, "text": "просто болтовня"}, "g4")
+    assert len(seen) == 1
+
+
+def test_per_chat_override_beats_the_global_flag_in_both_directions():
+    opted_out = with_mentions(make_adapter({
+        "require_mention": True, "require_mention_by_peer": {str(GROUP_PEER): False}}))
+    seen = capture_events(opted_out)
+    run_inbound(opted_out, GROUP_MSG, "g5")
+    assert len(seen) == 1  # global on, this chat opted out
+
+    opted_in = with_mentions(make_adapter({
+        "require_mention": False, "require_mention_by_peer": {str(GROUP_PEER): True}}))
+    silent = capture_events(opted_in)
+    run_inbound(opted_in, GROUP_MSG, "g6")
+    assert silent == []  # global off, this chat opted in
+
+
+# ── inbound media: the switch and the cap ────────────────────────────────────
+
+def test_inbound_attachment_is_not_downloaded_when_the_switch_is_off():
+    adapter = make_adapter({"download_attachments": False})
+    adapter.client = RecordingClient()
+    seen = capture_events(adapter)
+    run_inbound(adapter, {**GROUP_MSG, "attachments": [
+        {"type": "photo", "photo": {"sizes": [{"width": 100, "url": "https://sun9-1.userapi.com/x.jpg"}]}}]}, "d1")
+    assert adapter.client.downloads == []
+    assert seen[0].media_urls == []
+    assert "[фото]" in seen[0].text  # the agent still learns what arrived
+
+
+def test_attachment_above_the_cap_is_reported_and_not_attached():
+    adapter = make_adapter({"max_attachment_bytes": 8})
+    adapter.client = RecordingClient(payload=b"0" * 64)
+    seen = capture_events(adapter)
+    run_inbound(adapter, {**GROUP_MSG, "attachments": [
+        {"type": "doc", "doc": {"url": "https://example.com/big.pdf", "title": "big.pdf"}}]}, "d2")
+    assert [cap for _, cap in adapter.client.downloads] == [8]  # the configured cap travelled, not 20 MiB
+    assert seen[0].media_urls == []
+    assert "не удалось загрузить" in seen[0].text
+
+
+# ── the exec-approval card the core renders through us ───────────────────────
+
+def _payloads(keyboard) -> list:
+    """Every callback payload in a keyboard, whatever nesting the builder uses.
+
+    ``_keyboard`` hands VK a JSON *string*, so a raw walk would silently find nothing — which is
+    exactly how a card that never built looked identical to a card nobody inspected.
+    """
+    if isinstance(keyboard, str):
+        keyboard = json.loads(keyboard)
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if "payload" in node:
+                found.append(json.loads(node["payload"]))
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(keyboard)
+    return found
+
+
+def test_exec_approval_card_carries_every_choice_bound_to_one_prompt():
+    """The core calls this through ``BasePlatformAdapter.send_exec_approval``; a broken card means a
+    dangerous command waits for text nobody types, so pin the contract: four choices, one id, the
+    session key stored against it."""
+    from gateway.platforms.base import ExecApprovalPrompt
+    adapter = make_adapter()
+    prompt = ExecApprovalPrompt(
+        chat_id="123456", session_key="sess-42", text="Запустить опасную команду?",
+        actions=[("Разрешить один раз", "once", "primary"), ("Разрешить на сессию", "session", ""),
+                 ("Разрешить всегда", "always", ""), ("Запретить", "deny", "danger")],
+        command="rm -rf /tmp/x", description="удаление файлов", smart_denied=False)
+    with open_loop() as loop:
+        result = loop.run_until_complete(adapter._send_exec_approval_prompt(prompt))
+    assert result.success
+    payloads = _payloads(adapter.client.sent[-1]["keyboard"])
+    assert [p["c"] for p in payloads] == ["once", "session", "always", "deny"]
+    assert all(p["v"] == "ea" for p in payloads)
+    ids = {p["id"] for p in payloads}
+    assert len(ids) == 1                       # one prompt, one id — presses cannot cross prompts
+    assert set(adapter._approval_state) == ids
+    assert adapter._approval_state[ids.pop()] == "sess-42"
+
+
+def test_clarify_card_renders_one_button_per_choice_plus_free_text():
+    """Same failure mode as the approval card: a malformed keyboard silently degrades to plain text."""
+    adapter = make_adapter()
+    with open_loop() as loop:
+        result = loop.run_until_complete(adapter.send_clarify(
+            "123456", "Какой вариант?", ["первый", "второй"], "cl-1", "sess-7"))
+    assert result.success
+    payloads = _payloads(adapter.client.sent[-1]["keyboard"])
+    assert [p["c"] for p in payloads] == ["0", "1", "other"]
+    assert all(p["v"] == "cl" and p["id"] == "cl-1" for p in payloads)
+    assert adapter._clarify_state["cl-1"] == "sess-7"
+
+
+def test_slash_confirm_card_renders_all_three_choices_in_one_row():
+    adapter = make_adapter()
+    with open_loop() as loop:
+        result = loop.run_until_complete(adapter.send_slash_confirm(
+            "123456", "Подтверждение", "Выполнить /restart?", "sess-8", "sc-1"))
+    assert result.success
+    payloads = _payloads(adapter.client.sent[-1]["keyboard"])
+    assert [p["c"] for p in payloads] == ["once", "always", "cancel"]
+    assert adapter._slash_confirm_state["sc-1"] == "sess-8"
 
 
 if __name__ == "__main__":
