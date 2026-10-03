@@ -294,4 +294,5 @@ if __name__ == "__main__":
     except Exception:
         print("FAIL live loop\n" + traceback.format_exc())
         sys.exit(1)
-    print("ok   live loop: connect → long poll → inbound → send → disconnect (incl. failed=1/2 recovery)")
+    print("ok   live loop: connect → long poll → inbound → send → disconnect "
+          "(incl. failed=1/2 recovery, cursor across a transport error, fallback sweep while the poll hangs)")

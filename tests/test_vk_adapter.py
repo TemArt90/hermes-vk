@@ -1714,19 +1714,75 @@ def test_client_video_upload_fails_loudly_without_an_upload_url():
     assert caught is not None and "video_id" in caught.message
 
 
+class _MiniMonkeypatch:
+    """The slice of pytest's ``monkeypatch`` the standalone runner needs, with the same undo semantics.
+
+    Without it the pytest-less path — which the README advertises as a way to check the plugin on hosts
+    where pytest is absent — crashed on every test that takes a fixture (measured: the whole file exited
+    with ``TypeError: missing 1 required positional argument``).
+    """
+
+    def __init__(self):
+        self._undo: list = []
+
+    def setattr(self, target, name, value=None):
+        old = getattr(target, name)
+        self._undo.append((target, name, old))
+        setattr(target, name, value)
+        return value
+
+    def setenv(self, name, value):
+        self._undo.append((os.environ, name, os.environ.get(name)))
+        os.environ[name] = str(value)
+
+    def delenv(self, name, raising=True):
+        self._undo.append((os.environ, name, os.environ.get(name)))
+        os.environ.pop(name, None)
+
+    def undo(self):
+        while self._undo:
+            target, name, old = self._undo.pop()
+            if target is os.environ and old is None:
+                os.environ.pop(name, None)
+            else:
+                setattr(target, name, old)
+
+
 if __name__ == "__main__":
+    import inspect
+    import tempfile
+
     tests = [(name, obj) for name, obj in sorted(globals().items())
              if name.startswith("test_") and callable(obj)]
-    failures = []
+    failures, skipped = [], []
     for name, fn in tests:
+        kwargs: dict = {}
+        tmpdir = None
+        unknown = [p for p in inspect.signature(fn).parameters
+                   if p not in {"monkeypatch", "tmp_path"}]
+        if unknown:
+            skipped.append(name)
+            print(f"skip {name} (нужна фикстура {', '.join(unknown)})")
+            continue
+        if "monkeypatch" in inspect.signature(fn).parameters:
+            kwargs["monkeypatch"] = _MiniMonkeypatch()
+        if "tmp_path" in inspect.signature(fn).parameters:
+            tmpdir = tempfile.mkdtemp(prefix="hermes-vk-test-")
+            kwargs["tmp_path"] = pathlib.Path(tmpdir)
         try:
-            fn()
+            fn(**kwargs)
         except Exception:
             failures.append((name, traceback.format_exc()))
             print(f"FAIL {name}")
         else:
             print(f"ok   {name}")
-    print(f"\n{len(tests) - len(failures)}/{len(tests)} passed")
+        finally:
+            if tmpdir:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            if "monkeypatch" in kwargs:
+                kwargs["monkeypatch"].undo()
+    print(f"\n{len(tests) - len(failures) - len(skipped)}/{len(tests)} passed"
+          + (f", {len(skipped)} skipped" if skipped else ""))
     for name, tb in failures:
         print(f"\n=== {name} ===\n{tb}")
     sys.exit(1 if failures else 0)
