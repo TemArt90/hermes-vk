@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import pathlib
 
+import _paths  # noqa: E402  (registers the plugin as `vk`, whatever this directory is called)
+
 PLUGIN_DIR = pathlib.Path(__file__).resolve().parents[1]
 
 
