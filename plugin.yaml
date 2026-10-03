@@ -1,7 +1,7 @@
 name: vk-platform
 label: VK
 kind: platform
-version: 1.2.0
+version: 1.3.0
 description: >
   VK (ВКонтакте) gateway adapter for Hermes Agent.
   Connects Hermes to a VK community bot through the Bots Long Poll API —
@@ -62,4 +62,20 @@ optional_env:
   - name: VK_MAX_ATTACHMENT_BYTES
     description: "Предел размера скачиваемого вложения в байтах (по умолчанию 20971520 = 20 МБ)"
     prompt: "Max inbound attachment size in bytes"
+    password: false
+  - name: VK_REACTIONS_ENABLED
+    description: "Реакции-подтверждения на входящее сообщение (по умолчанию false): 👌 пока агент работает, затем 👍 или 👎"
+    prompt: "Enable reaction acks? (true/false)"
+    password: false
+  - name: VK_REACTION_PROGRESS
+    description: "Номер реакции «в работе» (по умолчанию 10 = 👌); 0 — не ставить"
+    prompt: "Progress reaction id"
+    password: false
+  - name: VK_REACTION_OK
+    description: "Номер реакции успеха (по умолчанию 4 = 👍); 0 — снимать реакцию вместо неё"
+    prompt: "Success reaction id"
+    password: false
+  - name: VK_REACTION_FAIL
+    description: "Номер реакции ошибки (по умолчанию 8 = 👎)"
+    prompt: "Failure reaction id"
     password: false

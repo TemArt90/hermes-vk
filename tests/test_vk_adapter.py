@@ -21,8 +21,9 @@ from types import SimpleNamespace
 import _paths  # noqa: E402  (registers the plugin as `vk`, whatever this directory is called)
 
 from vk.adapter import (  # noqa: E402
-    VKAdapter, _is_group, _keyboard, _peer_bool_map, _vk_mention_patterns, command_keyboard,
+    VKAdapter, _is_group, _keyboard, _peer_bool_map, _reaction_id, _vk_mention_patterns, command_keyboard,
 )
+from gateway.platforms.event import ProcessingOutcome  # noqa: E402
 from vk.vk_markdown import VK_SAFE_ITEM_TYPES, render_chunks, to_plain, u16_len  # noqa: E402
 
 
@@ -215,12 +216,26 @@ class FakeClient:
     def __init__(self):
         self.sent = []
         self.answers = []
+        self.edits = []
+        self.reactions = []
+        self.reaction_deletes = []
         self.group_id = -777
         self.group_name = "Тестовое сообщество"
 
     async def send_message(self, peer_id, message, **kwargs):
         self.sent.append({"peer_id": peer_id, "message": message, **kwargs})
         return 1000 + len(self.sent)
+
+    async def edit_message(self, peer_id, message_id, message, **kwargs):
+        self.edits.append({"peer_id": peer_id, "message_id": message_id, "message": message, **kwargs})
+
+    async def send_reaction(self, peer_id, cmid, reaction_id):
+        self.reactions.append((peer_id, cmid, reaction_id))
+        return True
+
+    async def delete_reaction(self, peer_id, cmid):
+        self.reaction_deletes.append((peer_id, cmid))
+        return True
 
     async def answer_event(self, event_id, user_id, peer_id, text):
         self.answers.append((text, event_id))
@@ -848,6 +863,146 @@ def test_slash_confirm_card_renders_all_three_choices_in_one_row():
     payloads = _payloads(adapter.client.sent[-1]["keyboard"])
     assert [p["c"] for p in payloads] == ["once", "always", "cancel"]
     assert adapter._slash_confirm_state["sc-1"] == "sess-8"
+
+
+# ── editing a sent message in place ─────────────────────────────────────────
+
+def test_edit_message_rewrites_plain_text_in_place():
+    """``messages.edit`` takes no ``format_data``, so markup must be flattened, not sent verbatim."""
+    adapter = make_adapter()
+    with open_loop() as loop:
+        result = loop.run_until_complete(adapter.edit_message("123456", "1000", "привет **мир**"))
+    assert result.success and result.message_id == "1000"
+    assert adapter.client.edits == [{"peer_id": 123456, "message_id": 1000, "message": "привет мир"}]
+
+
+def test_edit_message_reports_content_that_cannot_fit_one_message():
+    """An edit cannot split, so over-long content is handed back for the caller to send anew."""
+    adapter = make_adapter()
+    with open_loop() as loop:
+        result = loop.run_until_complete(adapter.edit_message("123456", "1000", "абв " * 1200))
+    assert not result.success
+    assert "one VK message" in (result.error or "")
+    assert adapter.client.edits == []
+
+
+def test_edit_message_refuses_invalid_ids_without_calling_the_api():
+    adapter = make_adapter()
+    with open_loop() as loop:
+        result = loop.run_until_complete(adapter.edit_message("не-id", "1000", "текст"))
+    assert not result.success
+    assert adapter.client.edits == []
+
+
+# ── reactions: opt-in acks driven by the core's lifecycle hooks ──────────────
+
+REACTION_MSG = {**GROUP_MSG, "id": 910, "conversation_message_id": 4567}
+
+
+def _event_for(adapter, message):
+    """Drive one inbound message and hand back the event the hooks receive."""
+    seen = capture_events(adapter)
+    run_inbound(adapter, message, f"r{message['id']}")
+    assert seen, "сообщение должно было дойти до агента"
+    return seen[0]
+
+
+def test_reaction_ids_parse_with_a_default_for_junk():
+    assert _reaction_id(None, 4) == 4
+    assert _reaction_id("", 4) == 4
+    assert _reaction_id("9", 4) == 9
+    assert _reaction_id("0", 4) == 0          # 0 is meaningful: the step is off
+    assert _reaction_id("что-то", 4) == 4
+    assert _reaction_id("-3", 4) == 4
+
+
+def test_reactions_are_off_by_default():
+    adapter = make_adapter()
+    event = _event_for(adapter, REACTION_MSG)
+    with open_loop() as loop:
+        loop.run_until_complete(adapter.on_processing_start(event))
+        loop.run_until_complete(adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS))
+    assert adapter.client.reactions == [] and adapter.client.reaction_deletes == []
+
+
+def test_progress_reaction_addresses_the_inbound_message_by_cmid():
+    """VK reactions use ``cmid``; sending the message id instead would fail with error 100."""
+    adapter = make_adapter({"reactions_enabled": True})
+    event = _event_for(adapter, REACTION_MSG)
+    with open_loop() as loop:
+        loop.run_until_complete(adapter.on_processing_start(event))
+    assert adapter.client.reactions == [(GROUP_PEER, 4567, 10)]
+
+
+def test_final_reaction_replaces_the_ack_with_the_outcome():
+    adapter = make_adapter({"reactions_enabled": True})
+    event = _event_for(adapter, REACTION_MSG)
+    with open_loop() as loop:
+        loop.run_until_complete(adapter.on_processing_start(event))
+        loop.run_until_complete(adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS))
+        loop.run_until_complete(adapter.on_processing_complete(event, ProcessingOutcome.FAILURE))
+    assert adapter.client.reactions == [(GROUP_PEER, 4567, 10), (GROUP_PEER, 4567, 4), (GROUP_PEER, 4567, 8)]
+
+
+def test_cancelled_turn_is_left_without_a_reaction():
+    adapter = make_adapter({"reactions_enabled": True})
+    event = _event_for(adapter, REACTION_MSG)
+    with open_loop() as loop:
+        loop.run_until_complete(adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED))
+    assert adapter.client.reaction_deletes == [(GROUP_PEER, 4567)]
+    assert adapter.client.reactions == []
+
+
+def test_reaction_steps_are_configurable_and_zero_turns_one_off():
+    adapter = make_adapter({"reactions_enabled": True, "reaction_progress": 0, "reaction_ok": 6})
+    event = _event_for(adapter, REACTION_MSG)
+    with open_loop() as loop:
+        loop.run_until_complete(adapter.on_processing_start(event))
+        loop.run_until_complete(adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS))
+    assert adapter.client.reactions == [(GROUP_PEER, 4567, 6)]  # only the configured final step
+
+
+def test_reaction_is_skipped_when_the_message_has_no_cmid():
+    adapter = make_adapter({"reactions_enabled": True})
+    seen = capture_events(adapter)
+    run_inbound(adapter, {**GROUP_MSG, "id": 911}, "r-no-cmid")  # no conversation_message_id
+    with open_loop() as loop:
+        loop.run_until_complete(adapter.on_processing_start(seen[0]))
+        loop.run_until_complete(adapter.on_processing_complete(seen[0], ProcessingOutcome.SUCCESS))
+    assert adapter.client.reactions == [] and adapter.client.reaction_deletes == []
+
+
+def test_rejected_reaction_does_not_disturb_the_turn():
+    """Errors 1009/1010/1011 are setup facts about the community's reaction map, not failures."""
+    from vk.vk_api import VkApiError as _Err
+    adapter = make_adapter({"reactions_enabled": True})
+    event = _event_for(adapter, REACTION_MSG)
+
+    async def reject(*args, **kwargs):
+        raise _Err("messages.sendReaction", 1010, "This reaction has been disabled")
+
+    adapter.client.send_reaction = reject
+    with open_loop() as loop:
+        loop.run_until_complete(adapter.on_processing_start(event))  # must not raise
+
+
+def test_missing_delete_reaction_is_remembered_not_retried():
+    """An older API answers ``deleteReaction`` with error 3; later calls then skip it."""
+    from vk.vk_api import VkApiError as _Err
+    adapter = make_adapter({"reactions_enabled": True})
+    event = _event_for(adapter, REACTION_MSG)
+    calls = {"n": 0}
+
+    async def boom(peer_id, cmid):
+        calls["n"] += 1
+        raise _Err("messages.deleteReaction", 3, "Unknown method passed")
+
+    adapter.client.delete_reaction = boom
+    with open_loop() as loop:
+        loop.run_until_complete(adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED))
+        loop.run_until_complete(adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED))
+    assert calls["n"] == 1                     # the second call is skipped, not retried
+    assert adapter._delete_reaction_supported is False
 
 
 if __name__ == "__main__":

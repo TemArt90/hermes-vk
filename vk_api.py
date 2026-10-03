@@ -23,7 +23,7 @@ API_BASE = "https://api.vk.com/method/"
 DEFAULT_API_VERSION = "5.199"
 
 # VK error codes seen in practice, mapped to the ``SendResult.error_kind`` vocabulary.
-_RETRYABLE_CODES = {1, 6, 9, 10, 16}
+_RETRYABLE_CODES = {1, 6, 9, 10, 16, 995}
 _RATE_LIMIT_CODES = {6, 9, 14}
 _FORBIDDEN_CODES = {5, 7, 15, 900, 901, 902, 936, 945}
 _NOT_FOUND_CODES = {100, 113, 936}
@@ -40,6 +40,10 @@ _ERROR_HINTS = {
     912: "у сообщества не включён «Чат-бот»: Управление → Сообщения → Настройки для бота — "
          "без него кнопки (вопросы агента, подтверждение команд) недоступны",
     6: "превышен лимит запросов в секунду (20/с на сообщество)",
+    995: "временная деградация сервиса VK — повторите позже",
+    1009: "такой реакции нет — проверьте номер реакции для этого сообщества",
+    1010: "эта реакция отключена в сообществе — выберите другую",
+    1011: "на сообщении уже достигнут предел реакций",
 }
 
 
@@ -254,6 +258,33 @@ class VkClient:
             timeout=30,
         )
         return int(response or 0)
+
+    async def edit_message(self, peer_id: int, message_id: int, message: str) -> None:
+        """Rewrite a message the bot already sent (``messages.edit``).
+
+        ``messages.edit`` takes no ``format_data`` parameter, so an edited message is plain text —
+        the renderer's markup only ever survives on the original ``messages.send``. It also cannot
+        split: content that does not fit one message has to be sent anew by the caller.
+        """
+        await self.call(
+            "messages.edit", peer_id=peer_id, message_id=message_id, message=message, timeout=30)
+
+    async def send_reaction(self, peer_id: int, cmid: int, reaction_id: int) -> bool:
+        """React to a message (``messages.sendReaction``).
+
+        Addressed by ``cmid`` — VK's conversation-local message number, not the ``message_id`` that
+        ``messages.send`` returns — and ``reaction_id`` is a per-community number, not an emoji.
+        A community token is accepted for this method (documented requirement: ``messages``).
+        """
+        response = await self.call(
+            "messages.sendReaction", peer_id=peer_id, cmid=cmid, reaction_id=reaction_id, timeout=20)
+        return bool(response)
+
+    async def delete_reaction(self, peer_id: int, cmid: int) -> bool:
+        """Remove the bot's reaction (``messages.deleteReaction``); takes the same ``cmid``."""
+        response = await self.call(
+            "messages.deleteReaction", peer_id=peer_id, cmid=cmid, timeout=20)
+        return bool(response)
 
     async def set_activity(self, peer_id: int, *, activity: str = "typing") -> None:
         await self.call(

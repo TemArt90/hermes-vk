@@ -51,7 +51,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult,
     cache_audio_from_bytes, cache_document_from_bytes, cache_image_from_bytes,
 )
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.platforms.helpers import MessageDeduplicator, cancel_task, compile_mention_patterns
 
 from .vk_api import DEFAULT_API_VERSION, VkApiError, VkClient
@@ -68,6 +68,11 @@ MAX_CALLBACK_PAYLOAD = 250
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 # Inbound media cap. A document or an audio message can exceed it; photos and voice notes do not.
 DEFAULT_MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+# VK reaction numbers. 4 = 👍, 10 = 👌, 8 = 👎 in the default community set — but VK numbers reactions
+# per community, so every step stays overridable and 0 switches a step off.
+DEFAULT_REACTION_PROGRESS = 10
+DEFAULT_REACTION_OK = 4
+DEFAULT_REACTION_FAIL = 8
 VOICE_MAX_SECONDS = 300
 # Update types that are expected noise for a bot (never worth a log line when enabled).
 _QUIET_UPDATE_TYPES = frozenset({"message_typing_state", "message_read", "message_allow", "message_deny"})
@@ -102,6 +107,17 @@ def _peer_bool_map(raw: Any) -> Dict[int, bool]:
         elif text in {"0", "false", "no", "off"}:
             out[peer] = False
     return out
+
+
+def _reaction_id(raw: Any, default: int) -> int:
+    """Parse a configured reaction number; anything unparsable falls back to the platform default."""
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
 
 
 def _vk_mention_patterns(group_id: int, group_name: str) -> List[str]:
@@ -247,6 +263,17 @@ class VKAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             self.max_attachment_bytes = DEFAULT_MAX_ATTACHMENT_BYTES
         self._mention_patterns: List[Any] = []
+        # Reactions: opt-in acks on the inbound message, driven by the processing hooks below.
+        self.reactions_enabled = _truthy(extra, "VK_REACTIONS_ENABLED", "reactions_enabled", False)
+        self.reaction_progress = _reaction_id(
+            _env(extra, "VK_REACTION_PROGRESS", "reaction_progress", None), DEFAULT_REACTION_PROGRESS)
+        self.reaction_ok = _reaction_id(
+            _env(extra, "VK_REACTION_OK", "reaction_ok", None), DEFAULT_REACTION_OK)
+        self.reaction_fail = _reaction_id(
+            _env(extra, "VK_REACTION_FAIL", "reaction_fail", None), DEFAULT_REACTION_FAIL)
+        # VK addresses a reaction by cmid, so the pair (chat, message id) -> cmid is kept for the hooks.
+        self._inbound_cmids: Dict[str, int] = {}
+        self._delete_reaction_supported: Optional[bool] = None
         self.client: Optional[VkClient] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._dedup = MessageDeduplicator(ttl_seconds=900)
@@ -451,6 +478,14 @@ class VKAdapter(BasePlatformAdapter):
             self._last_inbound[chat_id] = message_id
             if len(self._last_inbound) > 500:
                 self._last_inbound.pop(next(iter(self._last_inbound)))
+            with contextlib.suppress(TypeError, ValueError):
+                cmid = int(message.get("conversation_message_id") or 0)
+                if cmid:
+                    # Reactions need VK's cmid, which is not the id messages.send returns, so keep the
+                    # pair for the processing hooks. Capped like the inbound-id cache above.
+                    self._inbound_cmids[f"{chat_id}:{message_id}"] = cmid
+                    if len(self._inbound_cmids) > 500:
+                        self._inbound_cmids.pop(next(iter(self._inbound_cmids)))
 
         text = (message.get("text") or "").strip()
         if is_group and self._requires_mention(peer_id):
@@ -764,6 +799,102 @@ class VKAdapter(BasePlatformAdapter):
         return {"name": name, "type": "dm", "chat_id": str(peer_id)}
 
     # ------------------------------------------------------------------ interactive prompts
+
+    async def edit_message(self, chat_id: str, message_id: str, content: str,
+                           *, finalize: bool = False) -> SendResult:
+        """Rewrite an already-sent message in place (``messages.edit``).
+
+        Two VK facts shape this: ``messages.edit`` accepts no ``format_data``, so the text is
+        flattened with ``to_plain`` (markup only survives on the original send), and an edit cannot
+        split — content that does not fit one message reports failure so the caller sends it anew,
+        where splitting works as usual.
+        """
+        if self.client is None:
+            return SendResult(success=False, error="Not connected")
+        text = to_plain(content or "", self.MAX_MESSAGE_LENGTH)
+        if len(text) > self.MAX_MESSAGE_LENGTH:
+            return SendResult(success=False, error="content is longer than one VK message")
+        try:
+            await self.client.edit_message(int(chat_id), int(message_id), text)
+            return SendResult(success=True, message_id=str(message_id))
+        except (TypeError, ValueError):
+            return SendResult(
+                success=False, error=f"invalid VK ids: chat={chat_id!r} message={message_id!r}")
+        except Exception as exc:
+            logger.warning("VK: message edit failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    # ------------------------------------------------------------------ reactions (opt-in acks)
+    #
+    # The core drives these through its processing lifecycle hooks — ``on_processing_start`` and
+    # ``on_processing_complete(event, outcome)``, which the gateway calls itself around every turn.
+    # The generic base implementation swaps *emoji* reactions; VK numbers reactions per community, so
+    # these hooks use the configured numbers and the primitives below stay numeric.
+
+    def _reactions_enabled(self, event: Optional[MessageEvent] = None) -> bool:
+        return bool(self.reactions_enabled) and self.client is not None
+
+    def _cmid_for(self, chat_id: str, message_id: str) -> Optional[int]:
+        return self._inbound_cmids.get(f"{chat_id}:{message_id}")
+
+    async def _add_reaction(self, chat_id: str, message_id: str, reaction_id: int) -> bool:
+        """Set our reaction on a message we received; False when it cannot be addressed."""
+        cmid = self._cmid_for(str(chat_id), str(message_id))
+        if not reaction_id or cmid is None or self.client is None:
+            return False
+        try:
+            await self.client.send_reaction(int(chat_id), cmid, int(reaction_id))
+            return True
+        except VkApiError as exc:
+            # 1009/1010/1011 mean this community's reaction map differs (or is closed) — a fact about
+            # the setup, not a transport failure, so it stays at info level and never disturbs a turn.
+            logger.info("VK: reaction %s rejected (%s): %s", reaction_id, exc.code, exc.message)
+            return False
+        except Exception as exc:
+            logger.debug("VK: reaction failed: %s", exc)
+            return False
+
+    async def _remove_reaction(self, chat_id: str, message_id: str) -> bool:
+        """Drop our reaction; skipped entirely once VK reports it has no ``deleteReaction``."""
+        cmid = self._cmid_for(str(chat_id), str(message_id))
+        if cmid is None or self.client is None or self._delete_reaction_supported is False:
+            return False
+        try:
+            await self.client.delete_reaction(int(chat_id), cmid)
+            self._delete_reaction_supported = True
+            return True
+        except VkApiError as exc:
+            if exc.code == 3:  # "Unknown method passed": this community's API has no deleteReaction
+                self._delete_reaction_supported = False
+            logger.debug("VK: deleteReaction failed (%s): %s", exc.code, exc.message)
+            return False
+        except Exception as exc:
+            logger.debug("VK: deleteReaction failed: %s", exc)
+            return False
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """Ack the triggering message while the agent works (opt-in, off by default)."""
+        if not self._reactions_enabled(event) or self.reaction_progress <= 0:
+            return
+        await self._add_reaction(str(getattr(event.source, "chat_id", "") or ""),
+                                 str(getattr(event, "message_id", "") or ""), self.reaction_progress)
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        """Replace the ack with the outcome (👍 / 👎); a cancelled turn is left unreacted.
+
+        VK replaces the sender's previous reaction, so the final number can be sent straight over the
+        ack; the delete path exists for the cancelled case and for communities that stack instead.
+        """
+        if not self._reactions_enabled(event):
+            return
+        chat_id = str(getattr(event.source, "chat_id", "") or "")
+        message_id = str(getattr(event, "message_id", "") or "")
+        final_id = {ProcessingOutcome.SUCCESS: self.reaction_ok,
+                    ProcessingOutcome.FAILURE: self.reaction_fail}.get(outcome, 0)
+        if final_id <= 0:
+            await self._remove_reaction(chat_id, message_id)
+            return
+        await self._add_reaction(chat_id, message_id, final_id)
 
     async def send_clarify(self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
                            session_key: str, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
