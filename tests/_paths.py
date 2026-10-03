@@ -53,9 +53,16 @@ def _find_runtime() -> pathlib.Path | None:
 
 RUNTIME = _find_runtime()
 
-_register_plugin_package()
-if RUNTIME is not None and str(RUNTIME) not in sys.path:
-    sys.path.insert(0, str(RUNTIME))
+# ORDER MATTERS: executing the plugin package pulls in `gateway.*` (vk/__init__ -> adapter -> gateway),
+# and gateway in turn imports top-level modules that live beside it (`hermes_yaml`). Put the runtime on
+# sys.path FIRST — doing the registration first fails with "No module named 'hermes_yaml'" because
+# `gateway` alone can resolve while its siblings cannot.
+if RUNTIME is None:
+    sys.stderr.write(MISSING_RUNTIME_HINT + "\n")
+else:
+    if str(RUNTIME) not in sys.path:
+        sys.path.insert(0, str(RUNTIME))
+    _register_plugin_package()
 
 
 def require_runtime() -> pathlib.Path:
