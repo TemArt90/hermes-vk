@@ -91,15 +91,17 @@ cd <hermes-install>                       # каталог Hermes, где леж
 
 # канонический прогон (pytest не входит в runtime-venv Hermes)
 venv/bin/pip install pytest               # аддитивно; pip check остаётся чистым
-venv/bin/python -m pytest <plugin-dir> -q # 32 passed
+venv/bin/python -m pytest <plugin-dir> -q # 33 passed
 
 # то же самое без pytest — каждый файл умеет самозапуск
 PYTHONPATH=$PWD venv/bin/python <plugin-dir>/tests/test_vk_adapter.py
 PYTHONPATH=$PWD venv/bin/python <plugin-dir>/tests/test_vk_live_loop.py
 ```
 
-Пути разрешаются автоматически (`tests/conftest.py` находит runtime через `$HERMES_INSTALL`, стандартную
-раскладку `~/.hermes/hermes-agent` или текущий каталог), поэтому запускать можно откуда угодно.
+Пути разрешаются автоматически (`tests/_paths.py` находит runtime через `$HERMES_INSTALL`, стандартную
+раскладку `~/.hermes/hermes-agent` или текущий каталог) и регистрирует каталог плагина как пакет `vk`,
+поэтому запускать можно откуда угодно — в том числе из клона с дефисом в имени (`hermes-vk`), где имя
+каталога не является допустимым именем модуля.
 
 `test_vk_live_loop.py` поднимает на `127.0.0.1` мок VK API и Long Poll и проводит через настоящий
 адаптер полный цикл `connect() → long poll → входящее → send() → disconnect()`, включая восстановление

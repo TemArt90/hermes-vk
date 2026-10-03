@@ -24,3 +24,25 @@ def test_plugin_dir_carries_no_packaging_manifest():
         f"packaging manifest(s) in {PLUGIN_DIR} would disable the plugin on the next `hermes update`: {offenders}"
     )
     assert (PLUGIN_DIR / "pytest.ini").is_file(), "test config must live in pytest.ini (see docstring)"
+
+
+def test_init_loads_as_a_package_and_stays_importable_as_a_bare_module():
+    """``__init__.py`` must serve two callers with opposite needs.
+
+    Hermes' loader imports this directory as a package, so ``register`` must be the real function and a
+    failure there must stay loud. pytest instead resolves the package of a checkout by importing the
+    root ``__init__.py`` directly when the directory name is not a valid identifier — a plain
+    ``git clone`` lands in ``hermes-vk`` — where a relative import cannot resolve; that path must not
+    break collection (33 collection errors before the shim existed).
+    """
+    import importlib.util
+
+    import vk
+
+    assert callable(vk.register), "the package load must expose the real register()"
+
+    spec = importlib.util.spec_from_file_location("__init__", PLUGIN_DIR / "__init__.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # must not raise
+    assert module.register is None, "a bare module load has nothing to register"
