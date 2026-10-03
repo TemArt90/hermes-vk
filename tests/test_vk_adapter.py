@@ -22,6 +22,13 @@ from types import SimpleNamespace
 
 import _paths  # noqa: E402  (registers the plugin as `vk`, whatever this directory is called)
 
+# Tests must not inherit the developer's profile environment. The plugin reads VK_* from os.environ
+# first (by design), so a `VK_REACTIONS_ENABLED=true` sitting in ~/.hermes/.env silently flips every
+# test that asserts an off-by-default branch — measured, not theoretical: that is exactly how this
+# suite went red locally while CI, which has no profile, stayed green.
+for _inherited in [name for name in list(os.environ) if name.startswith("VK_")]:
+    os.environ.pop(_inherited, None)
+
 from vk.adapter import (  # noqa: E402
     VKAdapter, _is_group, _keyboard, _peer_bool_map, _reaction_id, _vk_mention_patterns, command_keyboard,
 )
@@ -935,6 +942,16 @@ def test_reactions_are_off_by_default():
         loop.run_until_complete(adapter.on_processing_start(event))
         loop.run_until_complete(adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS))
     assert adapter.client.reactions == [] and adapter.client.reaction_deletes == []
+
+
+def test_reactions_can_be_enabled_by_environment():
+    """The other half of the default: the env var turns them on (and the module guard above is why
+    this test cannot leak into the one before it)."""
+    os.environ["VK_REACTIONS_ENABLED"] = "true"
+    try:
+        assert make_adapter().reactions_enabled is True
+    finally:
+        os.environ.pop("VK_REACTIONS_ENABLED", None)
 
 
 def test_progress_reaction_addresses_the_inbound_message_by_cmid():
