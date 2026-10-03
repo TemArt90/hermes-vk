@@ -38,9 +38,11 @@ jobs:
       - name: Install test dependencies
         # Hermes' own dependency set is not pulled by a plain checkout, so the CI carries the slice the
         # tests actually touch: `hermes_yaml` imports ruamel.yaml, the transport is aiohttp, and the table
-        # converter reaches Hermes' agent.markdown_tables, which needs wcwidth. Add here when a test pulls
-        # in a new Hermes-internal dependency — the failing step names it.
-        run: python -m pip install --upgrade pip pytest aiohttp ruamel.yaml wcwidth
+        # converter reaches Hermes' agent.markdown_tables, which needs wcwidth. PyYAML is what the older
+        # Hermes revision imports directly (as `yaml`); current main routes YAML through hermes_yaml, so
+        # only the v2026.9.14 job strictly needs it — installing it in both keeps one recipe. Add here when
+        # a test pulls in a new Hermes-internal dependency — the failing step names it.
+        run: python -m pip install --upgrade pip pytest aiohttp ruamel.yaml wcwidth PyYAML
 
       - name: Run the suite
         run: python -m pytest -q
