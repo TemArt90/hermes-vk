@@ -451,7 +451,8 @@ def test_standalone_send_accepts_host_media_tuples():
     import tempfile as _tempfile
     import vk.adapter as adapter_mod
 
-    png = os.path.join(_tempfile.mkdtemp(prefix="vk-test-"), "chart.png")
+    tmpdir = _tempfile.mkdtemp(prefix="vk-test-")
+    png = os.path.join(tmpdir, "chart.png")
     with open(png, "wb") as handle:
         handle.write(b"\x89PNG\r\n\x1a\n" + b"0" * 32)
 
@@ -494,6 +495,9 @@ def test_standalone_send_accepts_host_media_tuples():
     # caption rides along with the photo; the missing path is skipped rather than fatal.
     assert len(sent) == 1, sent
     assert sent[0]["message"] == "отчёт готов" and sent[0]["attachment"] == "photo-777_1"
+    # mkdtemp alone leaked one directory per run — about 120 of them had piled up in the scratch
+    # area before anyone looked. Cleaned here, after the assertions that need the file.
+    shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def test_out_of_range_clarify_index_is_refused_rather_than_answered():
