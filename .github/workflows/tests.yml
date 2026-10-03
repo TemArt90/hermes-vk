@@ -1,0 +1,36 @@
+name: tests
+
+# Runs the plugin's suite on a clean GitHub machine: a fresh PyPI/OS environment, the plugin checked out
+# under its repository name (which is NOT `vk` — exactly the layout that once broke test collection), and
+# a freshly cloned Hermes runtime for the `gateway.*` imports. No secrets: the live-loop test mocks VK on
+# localhost and never touches the network, so nothing here can reach a real community.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    env:
+      # tests/_paths.py resolves the Hermes runtime from here
+      HERMES_INSTALL: ${{ github.workspace }}/.ci-hermes
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"   # the interpreter the plugin is developed against
+
+      - name: Clone the Hermes runtime (public repository)
+        run: git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$HERMES_INSTALL"
+
+      - name: Install test dependencies
+        # Hermes' own dependencies are not pulled by a plain checkout; the modules the tests import need
+        # exactly these two (`hermes_yaml` imports ruamel.yaml, the transport is aiohttp).
+        run: python -m pip install --upgrade pip pytest aiohttp ruamel.yaml
+
+      - name: Run the suite
+        run: python -m pytest -q

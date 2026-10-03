@@ -1,5 +1,8 @@
 # hermes-vk — канал ВКонтакте для Hermes Agent
 
+[![tests](https://github.com/TemArt90/hermes-vk/actions/workflows/tests.yml/badge.svg)](https://github.com/TemArt90/hermes-vk/actions/workflows/tests.yml)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 Плагин-адаптер, подключающий [Hermes Agent](https://hermes-agent.nousresearch.com/docs) к сообществу
 ВКонтакте. Входящие сообщения — через **Bots Long Poll API**, исходящие — через `messages.send`.
 Публичный адрес, домен и вебхук **не нужны**: Long Poll — это исходящее длинное соединение, поэтому
