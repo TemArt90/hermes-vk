@@ -570,13 +570,30 @@ def test_command_keyboard_is_a_persistent_bot_keyboard():
 
 
 def test_command_keyboard_is_attached_only_when_enabled():
-    """Off by default (it occupies the space above the input); the client drops ``keyboard=None``."""
-    off, on = make_adapter(), make_adapter(extra={"command_keyboard": True})
-    with open_loop() as loop:
-        loop.run_until_complete(off.send("123456", "просто текст"))
-        loop.run_until_complete(on.send("123456", "просто текст"))
-    assert off.client.sent[0].get("keyboard") is None
-    assert on.client.sent[0]["keyboard"] == command_keyboard()
+    """Off by default (it occupies the space above the input); the client drops ``keyboard=None``.
+
+    The environment variable deliberately wins over config, so an install whose profile sets
+    ``VK_COMMAND_KEYBOARD=true`` (a real one does) would flip the "off" half of this test. Clear it for
+    the assertion, restore it after — a test that only passes on a pristine environment is useless.
+    """
+    saved = os.environ.pop("VK_COMMAND_KEYBOARD", None)
+    try:
+        off, on = make_adapter(), make_adapter(extra={"command_keyboard": True})
+        with open_loop() as loop:
+            loop.run_until_complete(off.send("123456", "просто текст"))
+            loop.run_until_complete(on.send("123456", "просто текст"))
+        assert off.client.sent[0].get("keyboard") is None
+        assert on.client.sent[0]["keyboard"] == command_keyboard()
+        # the convention itself: env beats config, even when config asks for the keyboard
+        os.environ["VK_COMMAND_KEYBOARD"] = "false"
+        env_off = make_adapter(extra={"command_keyboard": True})
+        with open_loop() as loop:
+            loop.run_until_complete(env_off.send("123456", "просто текст"))
+        assert env_off.client.sent[0].get("keyboard") is None
+    finally:
+        os.environ.pop("VK_COMMAND_KEYBOARD", None)
+        if saved is not None:
+            os.environ["VK_COMMAND_KEYBOARD"] = saved
 
 
 def test_standalone_send_attaches_command_keyboard_when_enabled():
@@ -602,6 +619,7 @@ def test_standalone_send_attaches_command_keyboard_when_enabled():
 
     original = adapter_mod.VkClient
     adapter_mod.VkClient = FakeClient
+    saved = os.environ.pop("VK_COMMAND_KEYBOARD", None)   # the env wins over config — see the sibling test
     try:
         with open_loop() as loop:
             loop.run_until_complete(adapter_mod._standalone_send(
@@ -613,6 +631,8 @@ def test_standalone_send_attaches_command_keyboard_when_enabled():
             off = sent[-1]
     finally:
         adapter_mod.VkClient = original
+        if saved is not None:
+            os.environ["VK_COMMAND_KEYBOARD"] = saved
     assert on["keyboard"] == command_keyboard()
     assert off.get("keyboard") is None
 
