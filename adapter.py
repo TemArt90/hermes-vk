@@ -1203,9 +1203,14 @@ def register(ctx) -> None:
         allow_update_command=True,
         pii_safe=False,
         platform_hint=(
+            # Measured, not assumed: VK voids the WHOLE `format_data` payload when one item type is
+            # unsupported, so the adapter emits only the three types proven to survive live (bold,
+            # italic, url) and every other marker arrives as plain text. The hint used to promise
+            # `~~strike~~`, which made the model write markup the user never saw as struck.
             "You are chatting via VK (ВКонтакте) as a community bot. VK renders only **bold**, "
-            "*italic*, ~~strike~~ and [links](url); there are no code blocks, so keep code short and "
-            "plain. Messages are capped at 4096 characters and are split automatically. In group chats "
+            "*italic* and [links](url); there are no code blocks, and other markdown (strike, "
+            "underline, headings) arrives as plain text. Keep code short and plain. Messages are "
+            "capped at 4096 characters and are split automatically. In group chats "
             "your reply quotes the user's message. Buttons (choice prompts, command approvals) arrive as "
             "keyboard taps. Keep answers conversational."),
     )

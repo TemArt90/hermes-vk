@@ -1,0 +1,136 @@
+# Как устроен плагин
+
+Документ для того, кто будет править код. Отвечает на два вопроса: «куда смотреть» и «почему именно так».
+
+## 1. Что где лежит
+
+| Файл | Ответственность |
+|---|---|
+| `adapter.py` | Всё поведение канала: Long Poll, приём и разбор входящих, гейт упоминаний, отправка (текст, кнопки, медиа), реакции, правка сообщений, точки входа для ядра (`register`, `check_requirements`, `validate_config`, `is_connected`, `_env_enablement`, `_standalone_send`, `interactive_setup`) |
+| `vk_api.py` | Транспорт: HTTP-вызовы VK API (`VkClient`), загрузка файлов (фото/документ/голосовое), ошибки (`VkApiError` с `retryable` и `error_kind`) |
+| `vk_markdown.py` | Рендер Markdown → VK: разбивка на 4000 символов, `format_data` с UTF-16-смещениями, превращение таблиц, «плоский» текст для `messages.edit` |
+| `plugin.yaml` | Манифест: версия, `requires_env` (только `VK_TOKEN`), `optional_env` (все настройки) |
+| `tests/` | `test_vk_adapter.py` — поведение; `test_vk_live_loop.py` — цикл Long Poll на моке; `test_plugin_layout.py` — манифест; `_paths.py` — поиск рантайма Hermes |
+
+## 2. Входящее сообщение: путь и точки гейта
+
+```
+VK  →  Bots Long Poll (HTTPS, долгий запрос)
+      _poll_loop()            # те же server/key/ts при сбое — VK кэширует апдейты ~5 минут
+        ↓
+      _dispatch(update)        # фильтр _QUIET_UPDATE_TYPES: печатает/прочитал/разрешил — не наше дело
+        ↓
+      _handle_inbound(message, update_id=…)
+        ├─ MessageDeduplicator(ttl_seconds=900).is_duplicate(key)   # Long Poll умеет повторять апдейты
+        ├─ _requires_mention(peer_id) / _mentions_bot() / _strip_mention()   # только для бесед
+        ├─ _sender_authorized(user_id, chat_id, is_group)
+        ├─ _collect_attachments()  → _download_attachment()          # файлы в кэш агента
+        └─ MessageEvent → handle_message()                            # дальше — ядро Hermes
+```
+
+Двери нажатия на кнопки идут другим путём — `_handle_button_event()`, и там своя дедупликация по
+`event_id` (VK выдаёт одноразовый `event_id`, повторный ответ ломается с ошибкой `100`).
+
+Гейт упоминаний по умолчанию **выключен**: бот отвечает на всё. Включается `VK_REQUIRE_MENTION=true` или
+по беседам (`VK_REQUIRE_MENTION_BY_PEER`). Шаблоны упоминания строятся из id и имени сообщества
+(`_vk_mention_patterns`), свои можно задать `VK_MENTION_PATTERNS`.
+
+## 3. Исходящее сообщение
+
+```
+send(chat_id, content, reply_to)
+  ├─ render_chunks(content, 4000) → [(текст, format_data | None), …]
+  ├─ keyboard = command_keyboard() при VK_COMMAND_KEYBOARD
+  └─ messages.send(peer_id, message, format_data, keyboard, reply_to)
+
+медиа: _send_attachment(path, kind)  →  _upload_bytes(data, filename, kind, chat_id)
+                                        ├─ kind="photo" → upload_photo()            (peer_id=0 допустим)
+                                        ├─ kind="voice" → _to_ogg_opus() → upload_document(kind="audio_message")
+                                        └─ иначе        → upload_document(kind="doc")   (нужен настоящий peer_id!)
+```
+
+`send()` режет текст на 4000 символов (VK принимает 4096, но 96 символов резервируются на служебное).
+
+## 4. Четыре ловушки VK, определившие архитектуру
+
+1. **`format_data` обнуляется целиком, если хоть один элемент не поддержан.** Мы отправляли смесь
+   жирного и зачёркнутого — VK молча отбрасывал всю разметку. Поэтому в рендере белый список
+   `VK_SAFE_ITEM_TYPES = {"bold", "italic", "url"}`: всё остальное (зачёркнутый, подчёркнутый) отдаётся
+   плоским текстом, без маркеров. Отсюда же осторожная формулировка в `platform_hint` для модели.
+2. **Смещения `format_data` считаются в UTF-16-код-единицах.** `u16_len()` — про это; эмодзи занимает две
+   единицы, и смещение, попавшее в середину суррогатной пары, рисуется сломанным символом.
+3. **Реакции адресуются по `cmid`** (`conversation_message_id`), а не по `message_id`. Поэтому адаптер
+   запоминает пару «чат + message_id → cmid» (`_cmid_for`, `_inbound_to_cmid`), и без `cmid` реакция не
+   ставится вообще.
+4. **Загрузка документов требует настоящий `peer_id`.** `photos.getMessagesUploadServer` принимает `0`,
+   а `docs.getMessagesUploadServer` с `0` отвечает `100: peer_id is invalid`. Раньше это был живой дефект
+   (документы и голосовые падали); теперь в оба пути передаётся peer переписки.
+
+Ещё два ограничения VK, которые лечим, а не обходим: `messages.edit` **не** принимает `format_data` (поэтому
+правка идёт через `to_plain`), а `messages.sendReaction` не умеет «снять реакцию» — снятие делается
+заменой (`delete_reaction` возвращает `False` для ключей сообщества и это нормально).
+
+## 5. Тесты
+
+```bash
+# канонический прогон (из venv Hermes — оттуда виден рантайм gateway.*)
+cd /home/temart/.hermes/hermes-agent && venv/bin/python -m pytest /home/temart/.hermes/plugins/platforms/vk -q
+
+# самозапуск без pytest (файл умеет и так)
+cd /home/temart/.hermes/plugins/platforms/vk && /home/temart/.hermes/hermes-agent/venv/bin/python tests/test_vk_adapter.py
+```
+
+Правила, за которые уже заплачено:
+
+- **Герметичность.** В начале `test_vk_adapter.py` из окружения снимаются все `VK_*`. Иначе настройка из
+  профильного `.env` (например, `VK_REACTIONS_ENABLED=true`) ломает ветку «по умолчанию выключено» и тест
+  падает на рабочей машине при зелёном CI.
+- **`pytest.ini`, а не `pyproject.toml`.** Менеджер плагинов Hermes считает каталог с `pyproject.toml`
+  пакетом и запускает установку зависимостей; после неудачи плагин отключается.
+- **Тест обязан быть зубастым.** Скопировать плагин в `/tmp`, сломать ровно проверяемую ветку, прогнать —
+  нужный тест должен упасть. Зелёный прогон сам по себе ничего не доказывает (дефект карточек кнопок жил
+  при зелёных тестах, потому что их не было).
+- **`filterwarnings = error`** в `pytest.ini`: предупреждения не копятся.
+- Тесты в `test_vk_live_loop.py` не выходят в сеть: Long Poll поднимается на `localhost`.
+
+## 6. Как добавить настройку
+
+1. Значение читается **только** через `_env(...)` / `_truthy(...)` (они смотрят и в `extra`, и в окружение,
+   и в ключ конфига), в `__init__` адаптера.
+2. В `plugin.yaml` — запись в `optional_env` с `password: false` и понятным описанием по-русски.
+3. Строка в таблице настроек `README.md`.
+4. Тест: значение по умолчанию — выключено; включение через `extra` и через переменную окружения работает.
+5. **По умолчанию — выключено.** Всё, что меняет поведение канала, включается владельцем осознанно.
+
+## 7. Как добавить тип вложения
+
+Ветка — в `_upload_bytes` (`kind`) и, если нужно, в `_collect_attachments` для входящих. Имя `kind`
+совпадает с тем, что передаёт ядро (`photo`, `document`, `voice`) либо задано нами (`doc`, `video`).
+Не забыть: лимит `MAX_UPLOAD_BYTES`, ретрай `upload_with_retry` (VK иногда отвечает `405`), и живая
+проверка — файл действительно пришёл и имеет ожидаемый `attachment.type` при чтении назад.
+
+## 8. Релиз
+
+```bash
+# версия в манифесте, журнал и тег — ОДНИМ коммитом (урок 1.3.1–1.3.3: номер расходился с тегом)
+$EDITOR plugin.yaml           # version: X.Y.Z
+$EDITOR CHANGELOG.md          # секция ## X.Y.Z — что изменилось для пользователя
+git add -A && git commit -m "feat: …" && git tag -a vX.Y.Z -m "vX.Y.Z …" && git push origin main vX.Y.Z
+gh release create vX.Y.Z --title "vX.Y.Z …" --notes "…"
+```
+
+Правила: тесты/CI/документация — патч (X.Y.Z+1); новое поведение — минор (X.Y+1.0).
+После релиза обновить пин в `docs/catalog-submission.md` (sha, version, docs_url). **В каталог Hermes
+плагин не подаём** — решение владельца; заготовка лежит на случай смены решения.
+
+## 9. Живая проверка (обязательна для всего, что меняет поведение)
+
+```bash
+hermes gateway restart                      # ~1 минута простоя канала
+grep -i "VK: connected to community" ~/.hermes/logs/agent.log | tail -1
+hermes send --to vk:<peer_id> "проверка канала"
+```
+
+Проверкой считается факт: строка в логе и то, что сообщение дошло. «Должно работать» проверкой не
+считается — в этом плагине так уже трижды находились дефекты (`peer_id` документов, ffmpeg, карточки
+кнопок).
