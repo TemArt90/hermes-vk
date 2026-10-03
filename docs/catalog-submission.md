@@ -28,8 +28,8 @@
 name: hermes-vk
 title: VK (ВКонтакте) channel
 repo: https://github.com/TemArt90/hermes-vk
-sha: 1965d814128ff1bc3f25ba0fc2910a48d4d4377d
-version: "1.3.4"
+sha: f2f542a1fe5167640fdada9a1dc259a62379f88f
+version: "1.8.1"
 requires_hermes: ">=0.21.3"
 description: >-
   VK (ВКонтакте) community channel for Hermes Agent: inbound over the Bots Long Poll API (no public URL,
@@ -43,7 +43,12 @@ description: >-
   (VK_REACTIONS_ENABLED: a progress reaction while the agent works, then 👍 or 👎). Group chats can require a mention
   before the community answers (VK_REQUIRE_MENTION, with per-chat overrides and custom patterns), and
   inbound attachment download can be switched off or capped (VK_DOWNLOAD_ATTACHMENTS,
-  VK_MAX_ATTACHMENT_BYTES). An optional persistent command keyboard (VK_COMMAND_KEYBOARD=true) puts
+  VK_MAX_ATTACHMENT_BYTES). The command keyboard can be enabled per chat
+  (VK_COMMAND_KEYBOARD_BY_PEER), and an opt-in fallback sweep polls the newest conversations when Long
+  Poll has been silent for a whole interval (VK_FALLBACK_POLL_ENABLED, _INTERVAL_SECONDS, _BATCH_SIZE),
+  feeding the same handler through the same deduplicator. Videos are attempted as native VK video and
+  fall back to a document. Operator documentation ships in docs/ (development, troubleshooting,
+  update-guide, vk-api-notes). An optional persistent command keyboard (VK_COMMAND_KEYBOARD=true) puts
   /help, /status, /new and /stop under the input field, since VK has no command-list API for community
   bots. Disclosure — the community access token is read from the Hermes profile .env (VK_TOKEN) and sent
   only to api.vk.com; network egress is limited to VK hosts (api.vk.com for API and Long Poll, the upload
@@ -54,7 +59,7 @@ description: >-
 maintainer: TemArt90
 tier: community
 category: platform
-docs_url: https://github.com/TemArt90/hermes-vk/blob/1965d814128ff1bc3f25ba0fc2910a48d4d4377d/README.md
+docs_url: https://github.com/TemArt90/hermes-vk/blob/f2f542a1fe5167640fdada9a1dc259a62379f88f/README.md
 platforms: []
 capabilities:
   provides_tools: []
@@ -70,7 +75,7 @@ capabilities:
 
 Adds `plugin-catalog/hermes-vk.yaml` for **[hermes-vk](https://github.com/TemArt90/hermes-vk)** — a VK (ВКонтакте) community channel for Hermes Agent. I own that repository (`TemArt90`), per the owner-submitted rule.
 
-Pinned to the `v1.3.4` **release commit**: `1965d814128ff1bc3f25ba0fc2910a48d4d4377d` (annotated tag `v1.3.4`; the pin is the commit it points at, not the tag object, and it carries the same version string as the plugin manifest).
+Pinned to the `v1.8.1` **release commit**: `f2f542a1fe5167640fdada9a1dc259a62379f88f` (annotated tag `v1.8.1`; the pin is the commit it points at, not the tag object, and it carries the same version string as the plugin manifest).
 
 ## Why a second VK entry (there is already `vk-platform`)
 
