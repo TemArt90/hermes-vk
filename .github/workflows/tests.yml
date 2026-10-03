@@ -42,7 +42,18 @@ jobs:
         # Hermes revision imports directly (as `yaml`); current main routes YAML through hermes_yaml, so
         # only the v2026.9.14 job strictly needs it — installing it in both keeps one recipe. Add here when
         # a test pulls in a new Hermes-internal dependency — the failing step names it.
-        run: python -m pip install --upgrade pip pytest aiohttp ruamel.yaml wcwidth PyYAML
+        #
+        # Versions are PINNED to the developer's venv on purpose. Unpinned, an upstream release of any of
+        # these turns a green run red with no change on our side, and the failure names a dependency rather
+        # than our code — so a red CI stops meaning "we broke something". Bump deliberately, together with
+        # the venv, and let the matrix prove the older Hermes revision still works.
+        run: >-
+          python -m pip install --upgrade pip
+          pytest==9.1.1
+          aiohttp==3.14.3
+          ruamel.yaml==0.18.17
+          wcwidth==0.6.0
+          PyYAML==6.0.3
 
       - name: Run the suite
         run: python -m pytest -q
