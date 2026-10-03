@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 import _paths  # noqa: E402  (registers the plugin as `vk`, whatever this directory is called)
 
-from vk.adapter import VKAdapter, _is_group, _keyboard  # noqa: E402
+from vk.adapter import VKAdapter, _is_group, _keyboard, command_keyboard  # noqa: E402
 from vk.vk_markdown import VK_SAFE_ITEM_TYPES, render_chunks, to_plain, u16_len  # noqa: E402
 
 
@@ -550,6 +550,30 @@ def test_slash_command_text_stays_bare_while_chat_keeps_the_note():
         adapter_mod.cache_image_from_bytes = original
     assert event.text == "/new", event.text
     assert event.media_urls == ["/cache/stub.jpg"], event.media_urls  # the file itself still travels
+
+
+def test_command_keyboard_is_a_persistent_bot_keyboard():
+    """VK's substitute for `/` autocomplete: text buttons that send their own label.
+
+    It must be a *bot* keyboard (no ``inline``) and persistent (``one_time`` false), otherwise VK either
+    ties it to a single message or hides it after the first tap.
+    """
+    payload = json.loads(command_keyboard())
+    assert "inline" not in payload and payload["one_time"] is False
+    rows = [[button["action"]["label"] for button in row] for row in payload["buttons"]]
+    assert rows == [["/help", "/status"], ["/new", "/stop"]]
+    assert all(button["action"]["type"] == "text" for row in payload["buttons"] for button in row)
+    assert all(len(label) <= 40 for row in rows for label in row)
+
+
+def test_command_keyboard_is_attached_only_when_enabled():
+    """Off by default (it occupies the space above the input); the client drops ``keyboard=None``."""
+    off, on = make_adapter(), make_adapter(extra={"command_keyboard": True})
+    with open_loop() as loop:
+        loop.run_until_complete(off.send("123456", "просто текст"))
+        loop.run_until_complete(on.send("123456", "просто текст"))
+    assert off.client.sent[0].get("keyboard") is None
+    assert on.client.sent[0]["keyboard"] == command_keyboard()
 
 
 if __name__ == "__main__":

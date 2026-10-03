@@ -94,6 +94,24 @@ def _truthy(extra: dict, env: str, key: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+# Commands offered as one-tap buttons. VK has no `/` autocomplete API for community bots — no
+# endpoint declares a command list the way Telegram's setMyCommands does — so a "bot keyboard" whose
+# text buttons send their own label is the platform's substitute. Two rows of two keep it readable on
+# a phone; limits are <=10 rows x 5 buttons and a <=40 char label.
+_COMMAND_KEYBOARD_ROWS: tuple = (("/help", "/status"), ("/new", "/stop"))
+
+
+def command_keyboard() -> Optional[str]:
+    """VK bot keyboard (not inline) whose buttons send the command text when tapped.
+
+    A ``text`` button sends its own label as the user's message, so a button labelled ``/help`` is
+    indistinguishable from typing it — the tap arrives as an ordinary slash command.
+    """
+    rows = [[{"action": {"type": "text", "label": _kill(label, MAX_BUTTON_LABEL)},
+              "color": "secondary"} for label in row] for row in _COMMAND_KEYBOARD_ROWS]
+    return json.dumps({"one_time": False, "buttons": rows}, ensure_ascii=False)
+
+
 def _keyboard(rows: List[List[Tuple[str, Optional[Dict[str, Any]], str]]]) -> Optional[str]:
     """VK inline keyboard JSON; callback rows carry a compact JSON payload."""
     buttons: List[List[Dict[str, Any]]] = []
@@ -155,6 +173,8 @@ class VKAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             self.group_id = 0
         self.quote_in_groups = _truthy(extra, "VK_QUOTE_IN_GROUPS", "quote_in_groups", True)
+        # Off by default: a persistent keyboard occupies space above the input field.
+        self.command_keyboard = _truthy(extra, "VK_COMMAND_KEYBOARD", "command_keyboard", False)
         self.client: Optional[VkClient] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._dedup = MessageDeduplicator(ttl_seconds=900)
@@ -595,7 +615,8 @@ class VKAdapter(BasePlatformAdapter):
                 continue
             try:
                 last_id = await self.client.send_message(
-                    peer_id, text, reply_to=anchor if index == 0 else None, format_data=format_data)
+                    peer_id, text, reply_to=anchor if index == 0 else None, format_data=format_data,
+                    keyboard=command_keyboard() if self.command_keyboard else None)
                 sent_any = True
             except VkApiError as exc:
                 # VK error 100 on messages.send usually means a malformed format_data/keyboard;

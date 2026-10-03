@@ -1,7 +1,7 @@
 name: vk-platform
 label: VK
 kind: platform
-version: 1.0.0
+version: 1.1.0
 description: >
   VK (ВКонтакте) gateway adapter for Hermes Agent.
   Connects Hermes to a VK community bot through the Bots Long Poll API —
@@ -30,6 +30,10 @@ optional_env:
   - name: VK_GROUP_ID
     description: "ID сообщества (определяется автоматически из токена; укажите только если токен общий)"
     prompt: "Community id (optional)"
+    password: false
+  - name: VK_COMMAND_KEYBOARD
+    description: "Показывать клавиатуру с командами (/help, /status, /new, /stop): тап отправляет команду"
+    prompt: "Show a command keyboard? (true/false)"
     password: false
   - name: VK_QUOTE_IN_GROUPS
     description: "Цитировать входящее сообщение при ответе в беседе (по умолчанию true)"
