@@ -1251,7 +1251,13 @@ async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id: Op
     token = str(extra_or_secret(extra, "token", "VK_TOKEN", "") or "").strip()
     if not token:
         return send_error("VK standalone send: VK_TOKEN is not configured")
-    client = VkClient(token, api_version=str(extra.get("api_version") or DEFAULT_API_VERSION))
+    # The personal token rides along: ``video.save`` is a USER-scope method, so without it every ``.mp4``
+    # on this path (cron reports, `hermes send`) is refused with error 5 and degrades to a document.
+    # Measured live 2026-10-04: the gateway held the token, this path did not pass it, and the send log
+    # read "video upload refused (5) — sending vk-probe.mp4 as a document".
+    user_token = str(extra_or_secret(extra, "user_token", "VK_USER_TOKEN", "") or "").strip()
+    client = VkClient(token, api_version=str(extra.get("api_version") or DEFAULT_API_VERSION),
+                      user_token=user_token)
     try:
         try:
             peer_id = int(chat_id)

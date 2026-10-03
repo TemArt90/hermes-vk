@@ -325,10 +325,23 @@ class VkClient:
         if not upload_url or not video_id:
             raise VkApiError("video.save", 0, f"no upload_url/video_id in response: {str(saved)[:200]}")
         await self._upload(upload_url, data, filename)
-        return f"video{saved.get('owner_id')}_{video_id}"
+        # The reserved video is PRIVATE (``is_private=1``), so the attachment must carry its access key:
+        # measured live (2026-10-04) — ``video.save`` returns ``access_key``, and the bare
+        # ``video<owner>_<id>`` form leaves the recipient with a player that refuses to play. VK's own
+        # attachment format for a private video is ``video<owner>_<id>_<access_key>``.
+        attachment = f"video{saved.get('owner_id')}_{video_id}"
+        if saved.get("access_key"):
+            attachment += f"_{saved['access_key']}"
+        return attachment
 
     async def get_video_file(self, video: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """A downloadable file for an INBOUND video, using the optional user token.
+
+        MEASURED 2026-10-04: this no longer has anything to return. ``video.get`` answers with
+        ``files: None`` for every video tested — the owner's own and a community's, re-checked 5 s and 35 s
+        after an upload — and the only link it does expose (``direct_url``) is a ``vkvideo.ru`` HTML player
+        page, not a media file. The code is kept because the field may come back and the "no user token"
+        branch is still correct, but treat the return as permanently empty and keep the caller's note.
 
         ``video.get`` is one of the calls a community token cannot make — measured live on our own
         community key (2026-10-03): ``video.get`` and ``video.save`` both answer error 5

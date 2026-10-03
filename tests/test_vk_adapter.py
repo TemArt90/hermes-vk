@@ -477,7 +477,7 @@ def test_standalone_send_accepts_host_media_tuples():
     uploaded, sent = [], []
 
     class FakeClient:
-        def __init__(self, token, api_version=None):
+        def __init__(self, token, api_version=None, **kwargs):
             self.token = token
 
         async def resolve_group(self):
@@ -663,7 +663,7 @@ def test_standalone_send_attaches_command_keyboard_when_enabled():
     sent = []
 
     class FakeClient:
-        def __init__(self, token, api_version=None):
+        def __init__(self, token, api_version=None, **kwargs):
             self.token = token
 
         async def resolve_group(self):
@@ -1515,6 +1515,50 @@ def test_standalone_send_falls_back_to_a_document_when_video_is_refused(monkeypa
     assert holder["client"].sent[0][2]["attachment"] == "doc-777_9"
 
 
+def test_standalone_send_hands_the_personal_token_to_the_client(monkeypatch, tmp_path):
+    """The cron/`hermes send` path builds its own client, and it must receive the personal token.
+
+    Measured live 2026-10-04: the gateway held VK_USER_TOKEN, but this path constructed
+    ``VkClient(community_token, ...)`` — so ``video.save`` went out with the community key, VK answered
+    error 5, and the .mp4 degraded to a document while the direct API call worked fine.
+    """
+    import vk.adapter as mod
+
+    seen: dict = {}
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            seen["args"], seen["kwargs"] = args, kwargs
+            self.sent: list = []
+
+        async def resolve_group(self):
+            return (777, "Тест")
+
+        async def send_message(self, peer_id, message, **kwargs):
+            self.sent.append((peer_id, message, kwargs))
+            return 42
+
+        async def upload_video(self, *args, **kwargs):
+            return "video-777_9"
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(mod, "VkClient", lambda *a, **kw: _Client(*a, **kw))
+    monkeypatch.setattr(mod, "extra_or_secret",
+                        lambda extra, key, env, default="": "vk1.a.PERSONAL" if env == "VK_USER_TOKEN"
+                        else "vk1.a.COMMUNITY")
+    clip = tmp_path / "report.mp4"
+    clip.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"0" * 32)
+    with open_loop() as loop:
+        result = loop.run_until_complete(mod._standalone_send(
+            SimpleNamespace(extra={}), "123456", "отчёт", media_files=[str(clip)]))
+    assert result.get("success") is True
+    assert seen["args"][0] == "vk1.a.COMMUNITY", "the community token still opens the connection"
+    assert seen["kwargs"].get("user_token") == "vk1.a.PERSONAL", (
+        "without the personal token the video is refused with error 5 and arrives as a document")
+
+
 # ── клавиатура команд по чатам ───────────────────────────────────────────────
 
 def test_command_keyboard_is_decided_per_chat():
@@ -1705,6 +1749,28 @@ def test_client_video_upload_reserves_uploads_and_returns_the_attachment():
     assert calls == [("vk1.a.MOCK", "video.save",
                       {"name": "клип.mp4", "is_private": 1, "wallpost": 0, "timeout": 30})]
     assert uploads == [("https://up.example/v", "клип.mp4", 10)]
+
+
+def test_client_video_upload_keeps_the_access_key_so_the_recipient_can_play_it():
+    """A private video (``is_private=1``) is playable only through its access key.
+
+    Measured live 2026-10-04: ``video.save`` returns ``access_key``, and dropping it hands the recipient
+    a player that refuses to play — worse for the user than the document fallback this path exists to beat.
+    """
+    from vk.vk_api import VkClient
+    client = VkClient("vk1.a.MOCK")
+
+    async def _call_as(token, method, **params):
+        return {"upload_url": "https://up.example/v", "video_id": 5, "owner_id": -777,
+                "access_key": "abc123"}
+
+    async def _upload(url, data, filename):
+        return {}
+
+    client.call_as, client._upload = _call_as, _upload
+    with open_loop() as loop:
+        attachment = loop.run_until_complete(client.upload_video(b"f" * 10, "клип.mp4"))
+    assert attachment == "video-777_5_abc123"
 
 
 def test_client_video_upload_fails_loudly_without_an_upload_url():

@@ -1,7 +1,7 @@
 name: vk-platform
 label: VK
 kind: platform
-version: 1.11.1
+version: 1.12.0
 description: >
   VK (ВКонтакте) gateway adapter for Hermes Agent.
   Connects Hermes to a VK community bot through the Bots Long Poll API —
@@ -16,7 +16,7 @@ requires_env:
     password: true
 optional_env:
   - name: VK_USER_TOKEN
-    description: "НЕОБЯЗАТЕЛЬНО и только для видео: личный ключ доступа ВКонтакте (ваша страница, права «Видео»). С ним входящее видео скачивается агенту, а исходящее уходит нативным вложением. Ключ сообщества такие вызовы не пропускает (ошибка 5). Без него видео остаётся пометкой в тексте, а файл уходит документом"
+    description: "НЕОБЯЗАТЕЛЬНО и только для исходящего видео: личный ключ доступа ВКонтакте (ваша страница, права «Видео»). С ним .mp4/.mov/.webm уходят нативным вложением VK (включая access_key, иначе получатель видит непроигрываемое приватное видео), без него файл уходит документом. Ключ сообщества такие вызовы не пропускает (ошибка 5). Скачать ВХОДЯЩЕЕ видео нельзя ни с каким ключом: VK не отдаёт ссылок на файлы (замерено 04.10.2026 — поля files нет, direct_url это страница плеера vkvideo.ru)"
     prompt: "Personal VK token for video (optional)"
     password: true
   - name: VK_HOME_CHANNEL
