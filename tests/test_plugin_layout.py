@@ -26,14 +26,45 @@ def test_plugin_dir_carries_no_packaging_manifest():
     assert (PLUGIN_DIR / "pytest.ini").is_file(), "test config must live in pytest.ini (see docstring)"
 
 
+def test_package_load_failures_stay_loud_instead_of_degrading_to_none():
+    """The tolerance in ``__init__.py`` must cover ONLY the bare-module load.
+
+    A blanket ``try/except ImportError`` would also swallow a genuine failure on the loader's path:
+    the plugin would import cleanly and register nothing — much worse than an error at startup. This
+    pins the difference using a dying ``adapter.py`` next to a copy of the real ``__init__.py``.
+    """
+    import importlib.util
+    import shutil
+    import tempfile
+
+    staging = pathlib.Path(tempfile.mkdtemp(prefix="vk-dying-adapter-"))
+    try:
+        (staging / "__init__.py").write_text(
+            (PLUGIN_DIR / "__init__.py").read_text(encoding="utf-8"), encoding="utf-8")
+        (staging / "adapter.py").write_text("raise ImportError('adapter is broken')\n", encoding="utf-8")
+        spec = importlib.util.spec_from_file_location(
+            "hermes_plugins.platforms__vk", staging / "__init__.py",
+            submodule_search_locations=[str(staging)])
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(module)
+        except ImportError:
+            pass  # loud, as required
+        else:
+            raise AssertionError(f"a broken adapter was swallowed: register={module.register!r}")
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 def test_init_loads_as_a_package_and_stays_importable_as_a_bare_module():
     """``__init__.py`` must serve two callers with opposite needs.
 
-    Hermes' loader imports this directory as a package, so ``register`` must be the real function and a
-    failure there must stay loud. pytest instead resolves the package of a checkout by importing the
-    root ``__init__.py`` directly when the directory name is not a valid identifier — a plain
-    ``git clone`` lands in ``hermes-vk`` — where a relative import cannot resolve; that path must not
-    break collection (33 collection errors before the shim existed).
+    Hermes' loader imports this directory as a package, so ``register`` must be the real function here.
+    pytest instead resolves a checkout's package by importing the root ``__init__.py`` directly when the
+    directory name is not a valid identifier — a plain ``git clone`` lands in ``hermes-vk`` — where a
+    relative import cannot resolve; that path must not break collection (33 collection errors before the
+    shim existed).
     """
     import importlib.util
 
