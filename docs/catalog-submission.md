@@ -28,8 +28,8 @@
 name: hermes-vk
 title: VK (ВКонтакте) channel
 repo: https://github.com/TemArt90/hermes-vk
-sha: 357544be7eda4b64d8c8ff12a88e6f7bb5aa5d31
-version: "1.11.1"
+sha: f5e1a260f70f44bc10189e0579757771f6ae1437
+version: "1.12.0"
 requires_hermes: ">=0.21.3"
 description: >-
   VK (ВКонтакте) community channel for Hermes Agent: inbound over the Bots Long Poll API (no public URL,
@@ -78,7 +78,7 @@ capabilities:
 
 Adds `plugin-catalog/hermes-vk.yaml` for **[hermes-vk](https://github.com/TemArt90/hermes-vk)** — a VK (ВКонтакте) community channel for Hermes Agent. I own that repository (`TemArt90`), per the owner-submitted rule.
 
-Pinned to the `v1.11.1` **release commit**: `357544be7eda4b64d8c8ff12a88e6f7bb5aa5d31` (annotated tag `v1.11.1`; the pin is the commit it points at, not the tag object, and it carries the same version string as the plugin manifest).
+Pinned to the `v1.12.0` **release commit**: `f5e1a260f70f44bc10189e0579757771f6ae1437` (annotated tag `v1.12.0`; the pin is the commit it points at, not the tag object, and it carries the same version string as the plugin manifest).
 
 ## Why a second VK entry (there is already `vk-platform`)
 
