@@ -207,9 +207,9 @@ def _keyboard(rows: List[List[Tuple[str, Optional[Dict[str, Any]], str]]]) -> Op
 def _find_ffmpeg() -> Optional[str]:
     """ffmpeg for voice transcoding: ``PATH`` first, then the copy Hermes bundles under ``tools/``.
 
-    The gateway runs as a service whose PATH holds neither — a ``shutil.which``-only lookup returned
-    None, so every voice message was sent unconverted (and, for anything not already Ogg Opus, landed
-    as a plain file instead of a voice bubble).
+    The fallback covers hosts whose service PATH carries no ffmpeg at all. It is *not* a repair of a
+    broken voice path here: measured afterwards, ``/usr/bin/ffmpeg`` is on the gateway's PATH and
+    encodes Opus fine. Keep both, prefer whatever the operator put on PATH.
     """
     found = shutil.which("ffmpeg")
     if found:
