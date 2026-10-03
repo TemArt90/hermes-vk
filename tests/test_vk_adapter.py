@@ -507,6 +507,29 @@ def test_in_range_clarify_index_resolves_with_the_label_not_the_number():
     assert adapter.client.answers == [("✓ два", "e12")], adapter.client.answers
 
 
+def test_slash_command_text_stays_bare_while_chat_keeps_the_note():
+    """A command sent with an attachment must arrive as the bare command.
+
+    Notes about attachments/geo/forwards share the message text so the agent sees what arrived; for a
+    slash command that would turn ``/new`` into ``/new\\n[геопозиция]`` and hand the note to the
+    command handler as its argument (session name, title, save target …).
+    """
+    adapter = make_adapter()
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    adapter.handle_message = capture
+    common = {"date": 1_700_000_000, "peer_id": 123456, "from_id": 123456, "out": 0,
+              "attachments": [], "geo": {"coordinates": {"latitude": 0.0, "longitude": 0.0}}}
+    with open_loop() as loop:
+        loop.run_until_complete(adapter._handle_inbound({**common, "id": 900, "text": "/new"}, update_id="c1"))
+        loop.run_until_complete(adapter._handle_inbound({**common, "id": 901, "text": "привет"}, update_id="c2"))
+    assert captured[0].text == "/new", captured[0].text
+    assert captured[1].text == "привет\n[геопозиция]", captured[1].text
+
+
 if __name__ == "__main__":
     tests = [(name, obj) for name, obj in sorted(globals().items())
              if name.startswith("test_") and callable(obj)]

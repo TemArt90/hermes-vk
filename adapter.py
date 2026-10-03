@@ -351,7 +351,12 @@ class VKAdapter(BasePlatformAdapter):
         forwards = message.get("fwd_messages") or []
         if forwards:
             notes.append(f"[пересланных сообщений: {len(forwards)}]")
-        if notes:
+        if notes and not text.startswith("/"):
+            # Sent text and attachment/geo/forward notes share one string so the agent can see what
+            # arrived. For a slash command they must stay apart: the core reads everything after the
+            # command word as its arguments, so "/new" + a photo would arrive as "/new\n[вложение: …]"
+            # and hand the note to /new (session name), /title, /save … as an argument. The attachment
+            # itself is unaffected — it still travels in media_urls/media_types.
             text = (text + "\n" + " ".join(notes)).strip()
 
         reply = message.get("reply_message") or {}
