@@ -39,6 +39,18 @@ optional_env:
     description: "Переопределить клавиатуру для конкретных чатов: «peer_id:true,peer_id:false» (остальные наследуют общий флаг)"
     prompt: "Per-chat keyboard overrides"
     password: false
+  - name: VK_FALLBACK_POLL_ENABLED
+    description: "Страховка: если Long Poll замолчал, раз в интервал опрашивать историю бесед (по умолчанию false)"
+    prompt: "Enable the fallback history poll? (true/false)"
+    password: false
+  - name: VK_FALLBACK_POLL_INTERVAL_SECONDS
+    description: "Интервал резервного опроса, секунды (по умолчанию 60; минимум 15)"
+    prompt: "Fallback poll interval (seconds)"
+    password: false
+  - name: VK_FALLBACK_POLL_BATCH_SIZE
+    description: "Сколько бесед просматривать за один проход (по умолчанию 20)"
+    prompt: "Fallback poll batch size"
+    password: false
   - name: VK_QUOTE_IN_GROUPS
     description: "Цитировать входящее сообщение при ответе в беседе (по умолчанию true)"
     prompt: "Quote in group chats? (true/false)"

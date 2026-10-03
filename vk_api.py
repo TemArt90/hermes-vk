@@ -163,6 +163,19 @@ class VkClient:
             raise VkApiError("groups.getLongPollServer", 0, "no long-poll server in response")
         return response
 
+    async def get_conversations(self, *, count: int = 20) -> List[Dict[str, Any]]:
+        """Newest conversations with their last message (``messages.getConversations``).
+
+        Used only by the fallback sweep: while Long Poll is silent this is how the adapter learns that
+        something arrived. A community token sees the conversations the community takes part in; the
+        entries without a ``last_message`` (possible in VK's payload) are dropped here so the caller can
+        trust every item it iterates.
+        """
+        response = await self.call("messages.getConversations", count=count, filter="all", timeout=20)
+        items = (response or {}).get("items") or []
+        return [item for item in items
+                if isinstance(item, dict) and isinstance(item.get("last_message"), dict)]
+
     async def poll(self, server: str, key: str, ts: Any, *, wait: int = 25) -> Dict[str, Any]:
         """One ``a_check`` request. Returns ``{"ts":…, "updates":[…]}`` or ``{"failed": n}``."""
         session = await self._get_session()

@@ -64,6 +64,10 @@ GROUP_PEER_OFFSET = 2_000_000_000  # VK: conversation peer ids start here
 LONG_POLL_WAIT = 25
 FIRST_POLL_TIMEOUT = 35.0
 TRANSPORT_SILENCE_SECONDS = 150.0
+# Fallback sweep: a history poll used only while Long Poll has been silent for a whole interval. It is
+# a net under the primary path, never a second path — a healthy Long Poll must see no traffic from it.
+FALLBACK_POLL_INTERVAL = 60      # seconds between sweeps
+FALLBACK_POLL_BATCH = 20         # conversations examined per sweep
 MAX_BUTTON_LABEL = 40
 MAX_CALLBACK_PAYLOAD = 250
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
@@ -322,6 +326,23 @@ class VKAdapter(BasePlatformAdapter):
         self._last_inbound: Dict[str, str] = {}
         self._conn: Tuple[str, str, Any] = ("", "", 0)
         self._last_poll_ok = 0.0
+        # Fallback sweep (opt-in): if Long Poll goes quiet for a whole interval, poll the history of the
+        # newest conversations so an answer still arrives. Clamped: a zero interval would hammer the API.
+        self.fallback_poll = _truthy(extra, "VK_FALLBACK_POLL_ENABLED", "fallback_poll_enabled", False)
+        try:
+            self.fallback_interval = max(15, int(_env(
+                extra, "VK_FALLBACK_POLL_INTERVAL_SECONDS", "fallback_poll_interval_seconds",
+                FALLBACK_POLL_INTERVAL) or FALLBACK_POLL_INTERVAL))
+        except (TypeError, ValueError):
+            self.fallback_interval = FALLBACK_POLL_INTERVAL
+        try:
+            self.fallback_batch = max(1, int(_env(
+                extra, "VK_FALLBACK_POLL_BATCH_SIZE", "fallback_poll_batch_size",
+                FALLBACK_POLL_BATCH) or FALLBACK_POLL_BATCH))
+        except (TypeError, ValueError):
+            self.fallback_batch = FALLBACK_POLL_BATCH
+        self._fallback_task: Optional[asyncio.Task] = None
+        self._fallback_since = 0.0
         self._first_poll_done: Optional[asyncio.Event] = None
         self._user_names: Dict[int, str] = {}
         self._chat_titles: Dict[str, str] = {}
@@ -373,6 +394,11 @@ class VKAdapter(BasePlatformAdapter):
                 retryable=True)
             return False
         self._mark_connected()
+        # Started only after the first poll answered: a connect that times out never leaves a sweep
+        # behind (disconnect() cancels it either way, this keeps the intent obvious).
+        self._fallback_since = time.time()
+        if self.fallback_poll:
+            self._fallback_task = asyncio.create_task(self._fallback_poll_loop())
         logger.info(
             "VK: connected to community %s (id=%s) as @%s", self.client.group_name or "?", self.client.group_id,
             self.client.group_name or "vk")
@@ -385,6 +411,8 @@ class VKAdapter(BasePlatformAdapter):
         self._mark_disconnected()
         await cancel_task(self._poll_task)
         self._poll_task = None
+        await cancel_task(getattr(self, "_fallback_task", None))
+        self._fallback_task = None
         await cancel_task(getattr(self, "_activity_task", None))
         if self.client is not None:
             with contextlib.suppress(Exception):
@@ -463,6 +491,45 @@ class VKAdapter(BasePlatformAdapter):
     @staticmethod
     async def _sleep(seconds: float) -> None:
         await asyncio.sleep(seconds * (0.8 + random.random() * 0.4))
+
+    # ------------------------------------------------------------------ fallback sweep
+
+    async def _fallback_sweep(self) -> None:
+        """One history sweep: the net under Long Poll for messages it never delivered.
+
+        Runs only while Long Poll has been silent for longer than one interval — a safety net, not a
+        second path, and a healthy Long Poll must see no traffic from it. Everything goes through
+        ``_handle_inbound``, whose deduplicator already covers a message Long Poll delivers late, so the
+        two paths can never hand the agent the same message twice.
+        """
+        if not self.fallback_poll or self.client is None:
+            return
+        if time.monotonic() - self._last_poll_ok < self.fallback_interval:
+            return
+        newest = self._fallback_since
+        for item in await self.client.get_conversations(count=self.fallback_batch):
+            message = item.get("last_message") or {}
+            try:
+                date = float(message.get("date") or 0)
+            except (TypeError, ValueError):
+                continue
+            if date > self._fallback_since:
+                await self._handle_inbound(message, update_id=f"fb{message.get('id')}")
+                newest = max(newest, date)
+        self._fallback_since = newest
+
+    async def _fallback_poll_loop(self) -> None:
+        """Drive the sweep until ``disconnect()`` cancels this task (same shape as ``_poll_loop``)."""
+        while True:
+            if self.client is None:
+                return
+            try:
+                await self._fallback_sweep()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:      # a sweep must never take the channel down
+                logger.debug("VK: fallback sweep failed: %s", exc)
+            await self._sleep(self.fallback_interval)
 
     def transport_liveness(self) -> Dict[str, Any]:
         """Seconds since the last completed poll request (diagnostics / tests)."""

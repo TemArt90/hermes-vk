@@ -17,6 +17,7 @@ import pathlib
 import re
 import shutil
 import sys
+import time
 import traceback
 from types import SimpleNamespace
 
@@ -232,6 +233,12 @@ class FakeClient:
         self.photo_uploads = []
         self.group_id = -777
         self.group_name = "Тестовое сообщество"
+        self.conversations: list = []
+        self.conversations_calls = 0
+
+    async def get_conversations(self, *, count=20):
+        self.conversations_calls += 1
+        return list(self.conversations)
 
     async def upload_photo(self, data, filename="image.jpg"):
         self.photo_uploads.append((filename, len(data)))
@@ -1471,6 +1478,74 @@ def test_standalone_send_honours_the_per_chat_keyboard_map(monkeypatch):
         loop.run_until_complete(mod._standalone_send(SimpleNamespace(extra=extra), "777777", "отчёт"))
     off, on = holder["clients"]
     assert off.sent[0]["keyboard"] is None and on.sent[0]["keyboard"] == command_keyboard()
+
+
+# ── резервный опрос истории (страховка под Long Poll) ────────────────────────
+
+def _conversation(mid: int, date: int, text: str) -> dict:
+    return {"last_message": {"id": mid, "date": date, "peer_id": 123456, "from_id": 123456,
+                             "text": text, "out": 0, "attachments": []}}
+
+
+def test_fallback_sweep_takes_only_messages_newer_than_the_marker():
+    """The marker is what keeps a sweep from replaying history at the agent on every pass."""
+    adapter = make_adapter({"fallback_poll_enabled": True})
+    adapter._last_poll_ok = time.monotonic() - 10_000        # Long Poll молчит давно
+    adapter._fallback_since = 1_700_000_100.0
+    adapter.client.conversations = [_conversation(1, 1_700_000_050, "старое"),
+                                    _conversation(2, 1_700_000_200, "новое")]
+    seen = capture_events(adapter)
+    with open_loop() as loop:
+        loop.run_until_complete(adapter._fallback_sweep())
+    assert [event.text for event in seen] == ["новое"]
+    assert adapter._fallback_since == 1_700_000_200.0        # маркер сдвинулся
+
+
+def test_fallback_sweep_is_skipped_while_long_poll_is_alive():
+    """Long Poll — основной путь: опрашивать историю при живом Long Poll значило бы тянуть беседы
+    впустую и отдавать дедупликатору работу, которой не должно быть."""
+    adapter = make_adapter({"fallback_poll_enabled": True})
+    adapter._last_poll_ok = time.monotonic()
+    adapter.client.conversations = [_conversation(1, 1_700_000_200, "не должно дойти")]
+    seen = capture_events(adapter)
+    with open_loop() as loop:
+        loop.run_until_complete(adapter._fallback_sweep())
+    assert adapter.client.conversations_calls == 0 and seen == []
+
+
+def test_fallback_poll_is_off_by_default_and_clamped():
+    """Выключено по умолчанию (как всё, что меняет поведение) и зажато: нулевой интервал бил бы по API."""
+    assert make_adapter().fallback_poll is False
+    adapter = make_adapter({"fallback_poll_enabled": True, "fallback_poll_interval_seconds": 0,
+                            "fallback_poll_batch_size": 0})
+    assert adapter.fallback_interval >= 15 and adapter.fallback_batch >= 1
+
+
+def test_fallback_sweep_survives_a_client_error():
+    """Сбой опроса не должен ронять канал: цикл ловит исключение и продолжает крутиться."""
+    adapter = make_adapter({"fallback_poll_enabled": True})
+    attempts = {"n": 0}
+
+    async def _boom(*args, **kwargs):
+        attempts["n"] += 1
+        raise RuntimeError("VK недоступен")
+
+    adapter.client.get_conversations = _boom
+    adapter._last_poll_ok = time.monotonic() - 10_000
+    adapter.fallback_interval = 0.05     # зажим интервала — для значений из конфига, не для теста
+
+    async def _drive():
+        task = asyncio.create_task(adapter._fallback_poll_loop())
+        await asyncio.sleep(0.3)
+        alive = not task.done()          # цикл пережил ошибку
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        return alive
+
+    with open_loop() as loop:
+        alive = loop.run_until_complete(_drive())
+    assert alive and attempts["n"] >= 2  # ошибка не убила цикл, он попробовал снова
 
 
 if __name__ == "__main__":

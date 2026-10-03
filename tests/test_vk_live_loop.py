@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import json
 import sys
+import time
 import traceback
 from typing import Any, Dict, List
 
@@ -40,6 +41,11 @@ class MockVk:
         # ``[]`` = an empty poll) and ``http_500_on`` fails that poll number with a transport error.
         self.batches: List[List[Dict[str, Any]]] = []
         self.http_500_on: set = set()
+        # Fallback-sweep material: what ``messages.getConversations`` answers, plus a way to make the
+        # long-poll socket hang (a wedged poll is the real-world trigger for the sweep).
+        self.conversations_payload: List[Dict[str, Any]] = []
+        self.longpoll_delay = 0.0
+        self.longpoll_delay_after = 1
         self.pending_updates: List[Dict[str, Any]] = [
             {"type": "message_new", "event_id": "e1",
              "object": {"message": {"id": 42, "date": 1_700_000_000, "peer_id": 555001, "from_id": 555001,
@@ -63,11 +69,17 @@ class MockVk:
             data = dict(await request.post())
             self.sent.append(data)
             return web.json_response({"response": 9001 + len(self.sent)})
+        if method == "messages.getConversations":
+            return web.json_response({"response": {
+                "count": len(self.conversations_payload),
+                "items": [{"last_message": message} for message in self.conversations_payload]}})
         return web.json_response({"response": {}})
 
     async def _longpoll(self, request: web.Request) -> web.Response:
         self.poll_count += 1
         self.poll_ts_seen.append(int(request.query.get("ts", 0)))
+        if self.longpoll_delay and self.poll_count > self.longpoll_delay_after:
+            await asyncio.sleep(self.longpoll_delay)   # a wedged poll: the socket never answers
         if self.poll_count in self.http_500_on:
             return web.Response(status=500, text="simulated transport failure")
         if self.fail_next_session and self.poll_count == 1:
@@ -154,10 +166,57 @@ async def scenario_connect_and_receive(fail_first_session: bool = False) -> None
         await mock.stop()
 
 
+async def scenario_fallback_sweep_delivers_while_long_poll_hangs() -> None:
+    """The net under Long Poll: a wedged poll must not make the community look dead.
+
+    Live meaning: while the long-poll socket is stuck (no completed poll → silence), the opt-in history
+    sweep is the only thing that brings the user's message in. The first poll answers normally so
+    ``connect()`` can finish; from the second one the socket hangs.
+
+    The history is populated AFTER connect on purpose: the sweep's marker starts at the moment the
+    channel connected, so only messages newer than that are delivered (anything older was already given
+    to Long Poll; see the README limitation).
+    """
+    mock = MockVk()
+    mock.pending_updates = []
+    mock.batches = [[] for _ in range(50)]        # polls answer, but never deliver anything
+    mock.longpoll_delay = 3.0
+    await mock.start()
+    original_base = vk_api.API_BASE
+    vk_api.API_BASE = f"http://127.0.0.1:{mock.port}/method/"
+    adapter = _make_adapter()
+    adapter.fallback_poll = True
+    adapter.fallback_interval = 0.2               # the clamp guards config values, not tests
+    received = []
+
+    async def capture(event):
+        received.append(event)
+
+    adapter.handle_message = capture
+    try:
+        assert await adapter.connect() is True, "connect() failed"
+        mock.conversations_payload = [{
+            "id": 77, "date": int(time.time()) + 2, "peer_id": 555001, "from_id": 555001,
+            "text": "через резервный опрос", "out": 0, "attachments": [], "conversation_message_id": 5}]
+        for _ in range(200):
+            if received:
+                break
+            await asyncio.sleep(0.05)
+        assert received and received[0].text == "через резервный опрос", [e.text for e in received]
+        assert "messages.getConversations" in mock.calls, "the sweep never asked for the history"
+        await adapter.disconnect()
+    finally:
+        with contextlib.suppress(Exception):
+            await adapter.disconnect()
+        vk_api.API_BASE = original_base
+        await mock.stop()
+
+
 def run() -> None:
     asyncio.run(scenario_connect_and_receive(fail_first_session=False))
     asyncio.run(scenario_connect_and_receive(fail_first_session=True))
     asyncio.run(scenario_cursor_survives_a_transport_error())
+    asyncio.run(scenario_fallback_sweep_delivers_while_long_poll_hangs())
 
 
 async def scenario_cursor_survives_a_transport_error() -> None:
@@ -223,6 +282,10 @@ def test_live_loop_recovers_a_dropped_session():
 
 def test_live_loop_keeps_the_cursor_across_a_transport_error():
     asyncio.run(scenario_cursor_survives_a_transport_error())
+
+
+def test_live_loop_fallback_sweep_delivers_while_long_poll_hangs():
+    asyncio.run(scenario_fallback_sweep_delivers_while_long_poll_hangs())
 
 
 if __name__ == "__main__":
