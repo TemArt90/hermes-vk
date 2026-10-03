@@ -28,9 +28,11 @@ jobs:
         run: git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$HERMES_INSTALL"
 
       - name: Install test dependencies
-        # Hermes' own dependencies are not pulled by a plain checkout; the modules the tests import need
-        # exactly these two (`hermes_yaml` imports ruamel.yaml, the transport is aiohttp).
-        run: python -m pip install --upgrade pip pytest aiohttp ruamel.yaml
+        # Hermes' own dependency set is not pulled by a plain checkout, so the CI carries the slice the
+        # tests actually touch: `hermes_yaml` imports ruamel.yaml, the transport is aiohttp, and the table
+        # converter reaches Hermes' agent.markdown_tables, which needs wcwidth. Add here when a test pulls
+        # in a new Hermes-internal dependency — the failing step names it.
+        run: python -m pip install --upgrade pip pytest aiohttp ruamel.yaml wcwidth
 
       - name: Run the suite
         run: python -m pytest -q
