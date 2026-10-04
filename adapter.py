@@ -57,6 +57,10 @@ from gateway.platforms.helpers import MessageDeduplicator, cancel_task, compile_
 
 from .vk_api import DEFAULT_API_VERSION, VkApiError, VkClient, redact_secrets
 from .vk_markdown import render_chunks, to_plain
+from .pickers import PickerStore, new_choice_record, new_model_record
+from .pickers import render as render_picker
+from .pickers import result_text as picker_result_text
+from .pickers import selection_warning
 from .tools import register_tools
 from .widgets import WidgetStore, counts, page_count
 
@@ -380,6 +384,10 @@ class VKAdapter(BasePlatformAdapter):
         # Interactive widgets (tickable lists). State is on disk because a widget outlives the process,
         # unlike the short-lived clarify/approval ids above.
         self.widgets = WidgetStore()
+        # Interactive pickers (/model, /reasoning, /fast). Deliberately in memory: a picker is a
+        # question asked now, and a press after a restart must say "устарел" rather than fire a
+        # callback whose closure died with the old process.
+        self.pickers = PickerStore()
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -819,6 +827,8 @@ class VKAdapter(BasePlatformAdapter):
             await self._resolve_slash_confirm(payload, event_id, user_id, peer_id)
         elif action == "w":
             await self._resolve_widget(payload, event_id, user_id, peer_id)
+        elif action in {"mk", "cp"}:
+            await self._resolve_picker(payload, event_id, user_id, peer_id)
         else:
             await self._answer_event(event_id, user_id, peer_id, "Кнопка устарела")
 
@@ -1179,6 +1189,216 @@ class VKAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("VK: keyboard send failed: %s", exc)
             return await self.send(chat_id, text, metadata=metadata)
+
+    # ------------------------------------------------------------------ pickers
+
+    async def send_model_picker(
+        self, chat_id: str, providers: list, current_model: str, current_provider: str,
+        session_key: str, on_model_selected, metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Two-step ``/model`` picker (provider → model) as an inline keyboard.
+
+        The core only calls this when the adapter type defines it (``_model_listing_reply``), and it
+        owns everything after the tap: our callback returns the confirmation text the core would have
+        printed, which we then show in the same message.
+        """
+        if self.client is None:
+            return SendResult(success=False, error="Not connected")
+        try:
+            peer_id = int(chat_id)
+        except (TypeError, ValueError):
+            return SendResult(success=False, error=f"invalid VK peer id: {chat_id!r}")
+        state = self.pickers.put(**new_model_record(
+            str(chat_id), session_key, list(providers or []), current_model or "",
+            current_provider or "", on_model_selected))
+        text, keyboard = render_picker(state)
+        try:
+            message_id = await self.client.send_message(peer_id, to_plain(text), keyboard=keyboard)
+        except Exception as exc:
+            self.pickers.drop(state["id"])
+            logger.warning("VK: model picker send failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+        self.pickers.update(state["id"], message_id=message_id)
+        return SendResult(success=True, message_id=str(message_id or ""))
+
+    async def send_choice_picker(
+        self, chat_id: str, title: str, choices: list, session_key: str, on_choice_selected,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Flat chooser for ``/reasoning``, ``/fast`` and friends: one tap → one value."""
+        if self.client is None:
+            return SendResult(success=False, error="Not connected")
+        try:
+            peer_id = int(chat_id)
+        except (TypeError, ValueError):
+            return SendResult(success=False, error=f"invalid VK peer id: {chat_id!r}")
+        if not choices:
+            return SendResult(success=False, error="no choices")
+        state = self.pickers.put(**new_choice_record(
+            str(chat_id), session_key, title or "", list(choices), on_choice_selected))
+        text, keyboard = render_picker(state)
+        try:
+            message_id = await self.client.send_message(peer_id, to_plain(text), keyboard=keyboard)
+        except Exception as exc:
+            self.pickers.drop(state["id"])
+            logger.warning("VK: choice picker send failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+        self.pickers.update(state["id"], message_id=message_id)
+        return SendResult(success=True, message_id=str(message_id or ""))
+
+    async def _refresh_picker(self, state: Dict[str, Any], peer_id: int) -> bool:
+        """Re-render a picker in its own message; ``False`` when the rewrite failed."""
+        message_id = state.get("message_id")
+        if message_id and self.client is not None:
+            text, keyboard = render_picker(state)
+            try:
+                await self.client.edit_message(int(peer_id), int(message_id), to_plain(text), keyboard=keyboard)
+            except Exception as exc:
+                logger.warning("VK: picker %s edit failed: %s", state.get("id"), exc)
+                return False
+        return True
+
+    async def _resolve_picker(self, payload: Dict[str, Any], event_id: str, user_id: int,
+                              peer_id: int) -> None:
+        """Apply one press inside a picker: page, drill down, or commit the choice."""
+        picker_id = str(payload.get("id") or "")
+        state = self.pickers.get(picker_id)
+        if state is None or str(state.get("chat_id")) != str(peer_id):
+            await self._answer_event(event_id, user_id, peer_id, "Выбор устарел")
+            return
+        if state.get("resolved"):
+            await self._answer_event(event_id, user_id, peer_id, "Выбор уже сделан")
+            return
+        action = str(payload.get("a") or "")
+        if state.get("kind") == "choice":
+            await self._press_choice_picker(state, action, payload, event_id, user_id, peer_id)
+            return
+        await self._press_model_picker(state, action, payload, event_id, user_id, peer_id)
+
+    async def _press_model_picker(self, state: Dict[str, Any], action: str, payload: Dict[str, Any],
+                                  event_id: str, user_id: int, peer_id: int) -> None:
+        picker_id = str(state["id"])
+        if action == "pg":
+            with contextlib.suppress(TypeError, ValueError):
+                state = self.pickers.update(picker_id, page=int(payload.get("p") or 0)) or state
+            await self._refresh_picker(state, peer_id)
+            await self._answer_event(event_id, user_id, peer_id, "Страница")
+            return
+        if action == "bk":
+            state = self.pickers.update(picker_id, view="providers", provider="", page=0) or state
+            await self._refresh_picker(state, peer_id)
+            await self._answer_event(event_id, user_id, peer_id, "К провайдерам")
+            return
+        if action == "x":
+            self.pickers.drop(picker_id)
+            if self.client is not None and state.get("message_id"):
+                with contextlib.suppress(Exception):
+                    await self.client.edit_message(
+                        int(peer_id), int(state["message_id"]), "⚙ Выбор закрыт — вызови /model снова",
+                        keyboard=json.dumps({"inline": True, "buttons": []}, ensure_ascii=False))
+            await self._answer_event(event_id, user_id, peer_id, "Закрыто")
+            return
+        if action == "pr":
+            slug = str(payload.get("s") or "")
+            provider = next((p for p in state.get("providers") or [] if str(p.get("slug")) == slug), None)
+            if provider is None:
+                await self._answer_event(event_id, user_id, peer_id, "Провайдер недоступен")
+                return
+            state = self.pickers.update(picker_id, view="models", provider=slug, page=0) or state
+            await self._refresh_picker(state, peer_id)
+            await self._answer_event(event_id, user_id, peer_id,
+                                     str(provider.get("name") or slug)[:60])
+            return
+        if action in {"md", "ok", "no"}:
+            if action == "no":
+                state = self.pickers.update(picker_id, view="models", pending_model="",
+                                            warning_title="", warning_message="") or state
+                await self._refresh_picker(state, peer_id)
+                await self._answer_event(event_id, user_id, peer_id, "Отменено")
+                return
+            model_id = str(payload.get("m") or state.get("pending_model") or "")
+            provider_slug = str(state.get("provider") or "")
+            provider = next((p for p in state.get("providers") or [] if str(p.get("slug")) == provider_slug), None)
+            known = [str(m) for m in (provider or {}).get("models") or []]
+            # A press carries the model id verbatim, so re-check it against the list the picker showed:
+            # a forged or stale payload must not switch to a model the user was never offered.
+            if not model_id or (known and model_id not in known):
+                await self._answer_event(event_id, user_id, peer_id, "Модель недоступна")
+                return
+            if action == "md":
+                warning = await selection_warning(model_id, provider_slug)
+                if warning is not None:
+                    state = self.pickers.update(
+                        picker_id, view="confirm", pending_model=model_id,
+                        warning_title=str(getattr(warning, "title", "") or "Дорогая модель"),
+                        warning_message=str(getattr(warning, "message", "") or "")) or state
+                    await self._refresh_picker(state, peer_id)
+                    await self._answer_event(event_id, user_id, peer_id, "Нужно подтверждение")
+                    return
+            await self._commit_picker_choice(state, model_id, provider_slug, event_id, user_id, peer_id)
+            return
+        await self._answer_event(event_id, user_id, peer_id, "Кнопка устарела")
+
+    async def _press_choice_picker(self, state: Dict[str, Any], action: str, payload: Dict[str, Any],
+                                   event_id: str, user_id: int, peer_id: int) -> None:
+        picker_id = str(state["id"])
+        if action == "pg":
+            with contextlib.suppress(TypeError, ValueError):
+                state = self.pickers.update(picker_id, page=int(payload.get("p") or 0)) or state
+            await self._refresh_picker(state, peer_id)
+            await self._answer_event(event_id, user_id, peer_id, "Страница")
+            return
+        if action == "x":
+            self.pickers.drop(picker_id)
+            if self.client is not None and state.get("message_id"):
+                with contextlib.suppress(Exception):
+                    await self.client.edit_message(
+                        int(peer_id), int(state["message_id"]), "Закрыто",
+                        keyboard=json.dumps({"inline": True, "buttons": []}, ensure_ascii=False))
+            await self._answer_event(event_id, user_id, peer_id, "Закрыто")
+            return
+        if action != "ch":
+            await self._answer_event(event_id, user_id, peer_id, "Кнопка устарела")
+            return
+        value = str(payload.get("c") or "")
+        offered = [str(choice.get("value")) for choice in state.get("choices") or []]
+        if value not in offered:
+            await self._answer_event(event_id, user_id, peer_id, "Вариант недоступен")
+            return
+        callback: Any = state.get("on_choice_selected")
+        body, succeeded = "Готово", True
+        if callable(callback):
+            try:
+                body = str(await callback(str(peer_id), value) or "Готово")
+            except Exception as exc:
+                body, succeeded = f"Не получилось: {exc}", False
+        self.pickers.update(picker_id, resolved=True, succeeded=succeeded)
+        await self._finish_picker(state, peer_id, body, succeeded)
+        await self._answer_event(event_id, user_id, peer_id, body.splitlines()[0][:60] if body else "Готово")
+
+    async def _commit_picker_choice(self, state: Dict[str, Any], model_id: str, provider_slug: str,
+                                    event_id: str, user_id: int, peer_id: int) -> None:
+        callback: Any = state.get("on_model_selected")
+        body, succeeded = "Готово", True
+        if callable(callback):
+            try:
+                body = str(await callback(str(peer_id), model_id, provider_slug) or "Готово")
+            except Exception as exc:
+                body, succeeded = f"Не удалось переключить: {exc}", False
+        self.pickers.update(str(state["id"]), resolved=True, succeeded=succeeded, pending_model=model_id)
+        await self._finish_picker(state, peer_id, body, succeeded)
+        await self._answer_event(event_id, user_id, peer_id, (body.splitlines()[0] or "Готово")[:60])
+
+    async def _finish_picker(self, state: Dict[str, Any], peer_id: int, body: str, succeeded: bool) -> None:
+        """Replace the picker with its outcome and drop the keyboard (an edit clears buttons)."""
+        message_id = state.get("message_id")
+        if not message_id or self.client is None:
+            return
+        text, keyboard = picker_result_text(dict(state, succeeded=succeeded), body)
+        try:
+            await self.client.edit_message(int(peer_id), int(message_id), to_plain(text), keyboard=keyboard)
+        except Exception as exc:
+            logger.warning("VK: picker outcome edit failed: %s", exc)
 
     # ------------------------------------------------------------------ outbound media
 
