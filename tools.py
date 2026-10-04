@@ -34,35 +34,43 @@ DESCRIPTION = (
 )
 
 SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "action": {
-            "type": "string",
-            "enum": ["create", "update", "reset", "close", "status"],
-            "description": "Что сделать со списком.",
+    # Full function schema, not just the parameters block: the registry reads ``schema["parameters"]``
+    # and the model-facing description from ``schema["description"]``. Passing only the parameters
+    # block registers the tool with EMPTY parameters and no description — silently, no error raised
+    # (measured: the live tool catalog showed ``properties: {}`` until this wrapper was added).
+    "name": TOOL_NAME,
+    "description": DESCRIPTION,
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["create", "update", "reset", "close", "status"],
+                "description": "Что сделать со списком.",
+            },
+            "items": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Позиции списка по порядку. Нужны для create и update.",
+            },
+            "title": {
+                "type": "string",
+                "description": "Заголовок списка, например «Список покупок». По умолчанию «Список».",
+            },
+            "widget_id": {
+                "type": "string",
+                "description": "id существующего списка. Если не указан, берётся активный список этого чата.",
+            },
+            "peer": {
+                "type": "string",
+                "description": (
+                    "VK peer id получателя. Обычно не нужен: берётся текущий чат, а вне чата — "
+                    "VK_HOME_CHANNEL."
+                ),
+            },
         },
-        "items": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Позиции списка по порядку. Нужны для create и update.",
-        },
-        "title": {
-            "type": "string",
-            "description": "Заголовок списка, например «Список покупок». По умолчанию «Список».",
-        },
-        "widget_id": {
-            "type": "string",
-            "description": "id существующего списка. Если не указан, берётся активный список этого чата.",
-        },
-        "peer": {
-            "type": "string",
-            "description": (
-                "VK peer id получателя. Обычно не нужен: берётся текущий чат, а вне чата — "
-                "VK_HOME_CHANNEL."
-            ),
-        },
+        "required": ["action"],
     },
-    "required": ["action"],
 }
 
 

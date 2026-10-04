@@ -373,6 +373,11 @@ def test_register_tools_hands_the_tool_to_the_plugin_context():
     assert captured["name"] == TOOL_NAME and captured["schema"] is SCHEMA
     assert captured["description"] == DESCRIPTION and captured["is_async"] is True
     assert captured["handler"].__name__ == "_handle"
+    # The registry reads schema["parameters"] and the model-facing description from schema itself:
+    # a bare parameters block registered the tool with empty arguments (measured live).
+    assert SCHEMA["name"] == TOOL_NAME and SCHEMA["description"] == DESCRIPTION
+    assert SCHEMA["parameters"]["required"] == ["action"]
+    assert {"action", "items", "title", "widget_id", "peer"} <= set(SCHEMA["parameters"]["properties"])
 
 
 if __name__ == "__main__":  # standalone fallback without pytest
