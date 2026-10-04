@@ -227,6 +227,7 @@ class FakeClient:
         self.sent = []
         self.answers = []
         self.edits = []
+        self.deletes = []
         self.reactions = []
         self.reaction_deletes = []
         self.doc_uploads = []
@@ -265,6 +266,10 @@ class FakeClient:
 
     async def edit_message(self, peer_id, message_id, message, **kwargs):
         self.edits.append({"peer_id": peer_id, "message_id": message_id, "message": message, **kwargs})
+
+    async def delete_message(self, peer_id, message_id, **kwargs):
+        self.deletes.append({"peer_id": peer_id, "message_id": message_id, **kwargs})
+        return True
 
     async def send_reaction(self, peer_id, cmid, reaction_id):
         self.reactions.append((peer_id, cmid, reaction_id))

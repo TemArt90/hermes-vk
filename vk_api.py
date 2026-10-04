@@ -393,6 +393,24 @@ class VkClient:
             "messages.edit", peer_id=peer_id, message_id=message_id, message=message,
             keyboard=keyboard, timeout=30)
 
+    async def delete_message(self, peer_id: int, message_id: int, *, for_all: bool = True) -> bool:
+        """Delete one message (``messages.delete``); ``True`` when VK reports it gone.
+
+        Addressed by the **global** message id — the value ``messages.send`` returned and that the
+        gateway passes back to ``delete_message`` — not by ``cmid``: measured live 04.10.2026,
+        ``messages.delete(message_ids=…)`` answers ``[{..., "response": 1}]`` and the message leaves
+        ``messages.getHistory``. ``delete_for_all`` is what makes it disappear for the recipient too;
+        without it the community only hides it on its own side.
+        """
+        response = await self.call(
+            "messages.delete", peer_id=peer_id, message_ids=message_id,
+            delete_for_all=1 if for_all else 0, timeout=20)
+        entries = response if isinstance(response, list) else [response]
+        for entry in entries:
+            if isinstance(entry, dict) and int(entry.get("response") or 0) == 1:
+                return True
+        return False
+
     async def send_reaction(self, peer_id: int, cmid: int, reaction_id: int) -> bool:
         """React to a message (``messages.sendReaction``).
 

@@ -1,7 +1,7 @@
 name: vk-platform
 label: VK
 kind: platform
-version: 1.14.0
+version: 1.15.0
 description: >
   VK (ВКонтакте) gateway adapter for Hermes Agent.
   Connects Hermes to a VK community bot through the Bots Long Poll API —

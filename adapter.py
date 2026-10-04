@@ -89,6 +89,11 @@ DEFAULT_REACTION_PROGRESS = 10
 DEFAULT_REACTION_OK = 4
 DEFAULT_REACTION_FAIL = 8
 VOICE_MAX_SECONDS = 300
+# Status bubbles (the core's `send_or_update_status` path): one editable message per status key
+# instead of one message per update. Reuse is bounded so a long-idle key cannot resurrect a bubble
+# from an old turn far up the chat, and the map is capped so a busy install cannot grow it forever.
+STATUS_BUBBLE_TTL_SECONDS = 600
+MAX_STATUS_BUBBLES = 200
 # Update types that are expected noise for a bot (never worth a log line when enabled).
 _QUIET_UPDATE_TYPES = frozenset({"message_typing_state", "message_read", "message_allow", "message_deny"})
 
@@ -381,6 +386,10 @@ class VKAdapter(BasePlatformAdapter):
         self._approval_state: Dict[str, str] = {}
         self._slash_confirm_state: Dict[str, str] = {}
         self._clarify_state: Dict[str, str] = {}
+        # Status streams ("⏳ Работаю…", "💻 Выполняю…") keyed by chat+status key → (message_id, last
+        # used). The core edits the previous bubble for the same key when the adapter can; without
+        # this map every status update arrived as its own message.
+        self._status_bubbles: Dict[str, Tuple[int, float]] = {}
         # Interactive widgets (tickable lists). State is on disk because a widget outlives the process,
         # unlike the short-lived clarify/approval ids above.
         self.widgets = WidgetStore()
@@ -1058,6 +1067,93 @@ class VKAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("VK: message edit failed: %s", exc)
             return SendResult(success=False, error=str(exc))
+
+    # ------------------------------------------------------------------ status & cleanup
+
+    def _status_bubble_key(self, chat_id: str, status_key: str) -> str:
+        return f"{chat_id}:{status_key or 'status'}"
+
+    def _prune_status_bubbles(self, now: Optional[float] = None) -> None:
+        """Drop bubbles that have been idle past the TTL and keep the map under its cap."""
+        now = time.time() if now is None else now
+        for key in [k for k, (_, used) in self._status_bubbles.items()
+                    if now - float(used) > STATUS_BUBBLE_TTL_SECONDS]:
+            self._status_bubbles.pop(key, None)
+        if len(self._status_bubbles) > MAX_STATUS_BUBBLES:
+            oldest = sorted(self._status_bubbles, key=lambda k: float(self._status_bubbles[k][1]))
+            for key in oldest[: len(self._status_bubbles) - MAX_STATUS_BUBBLES]:
+                self._status_bubbles.pop(key, None)
+
+    async def send_or_update_status(self, chat_id: str, status_key: str, content: str,
+                                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        """One editable bubble per status stream (the core's status path).
+
+        The gateway sends every status event through this method when the adapter defines it
+        (``gateway/run.py``: ``_send_or_update_status_coro``) and otherwise falls back to a plain send —
+        which is why a long turn used to leave a trail of one-line bubbles. The same ``status_key`` now
+        rewrites the bubble it created, so a stream of updates costs one message.
+
+        The bubble carries no keyboard: it is transient chatter, and attaching the command keyboard to
+        it would fight the chat keyboard for nothing. Reuse is bounded by TTL because an idle key must
+        not resurrect a bubble from a turn the user has already scrolled past.
+        """
+        if self.client is None:
+            return SendResult(success=False, error="Not connected")
+        try:
+            peer_id = int(chat_id)
+        except (TypeError, ValueError):
+            return SendResult(success=False, error=f"invalid VK peer id: {chat_id!r}")
+        text = to_plain(content or "", self.MAX_MESSAGE_LENGTH)[: self.MAX_MESSAGE_LENGTH]
+        if not text.strip():
+            return SendResult(success=False, error="empty status")
+        key = self._status_bubble_key(str(chat_id), status_key)
+        self._prune_status_bubbles()
+        existing = self._status_bubbles.get(key)
+        if existing is not None:
+            message_id, _ = existing
+            try:
+                await self.client.edit_message(peer_id, int(message_id), text)
+                self._status_bubbles[key] = (int(message_id), time.time())
+                return SendResult(success=True, message_id=str(message_id))
+            except Exception as exc:
+                # Deleted by hand, too old, or a transient refusal: forget it and send a fresh bubble
+                # rather than losing the status entirely.
+                logger.debug("VK: status bubble %s could not be edited (%s) — sending a new one", key, exc)
+                self._status_bubbles.pop(key, None)
+        try:
+            message_id = await self.client.send_message(peer_id, text)
+        except Exception as exc:
+            logger.warning("VK: status send failed: %s", exc)
+            return SendResult(success=False, error=str(exc), retryable=True)
+        if message_id:
+            self._status_bubbles[key] = (int(message_id), time.time())
+            logger.info("VK: status bubble opened for key=%s (peer=%s)", status_key or "status", peer_id)
+        return SendResult(success=True, message_id=str(message_id or ""))
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Remove one of the community's own messages (``messages.delete``).
+
+        The gateway calls this to clean up interim bubbles at the end of a turn (``display.cleanup_progress``)
+        and for ephemeral notices with a TTL; the base implementation answers ``False``, so before this
+        VK simply kept every bubble it had ever sent.
+        """
+        if self.client is None:
+            return False
+        try:
+            peer_id, mid = int(chat_id), int(message_id)
+        except (TypeError, ValueError):
+            logger.debug("VK: delete_message with invalid ids: chat=%r message=%r", chat_id, message_id)
+            return False
+        try:
+            deleted = await self.client.delete_message(peer_id, mid)
+        except Exception as exc:
+            logger.warning("VK: message delete failed: %s", exc)
+            return False
+        if deleted:
+            for key, (mapped, _used) in list(self._status_bubbles.items()):
+                if mapped == mid:
+                    self._status_bubbles.pop(key, None)
+        return bool(deleted)
 
     # ------------------------------------------------------------------ reactions (opt-in acks)
     #
