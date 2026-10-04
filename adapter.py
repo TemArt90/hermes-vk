@@ -89,6 +89,9 @@ DEFAULT_REACTION_PROGRESS = 10
 DEFAULT_REACTION_OK = 4
 DEFAULT_REACTION_FAIL = 8
 VOICE_MAX_SECONDS = 300
+# VK accepts a comma-separated attachment list, so a gallery can ride one message. The cap is the
+# number of attachments VK takes in one `messages.send` (measured, see CHANGELOG).
+MAX_ALBUM_ATTACHMENTS = 10
 # Status bubbles (the core's `send_or_update_status` path): one editable message per status key
 # instead of one message per update. Reuse is bounded so a long-idle key cannot resurrect a bubble
 # from an old turn far up the chat, and the map is capped so a busy install cannot grow it forever.
@@ -1564,6 +1567,101 @@ class VKAdapter(BasePlatformAdapter):
                               **kwargs) -> SendResult:
         return await self._send_attachment(
             chat_id, image_path, kind="photo", caption=caption, reply_to=reply_to, metadata=metadata)
+
+    @staticmethod
+    def _is_bundleable_photo(source: str) -> bool:
+        """Static images only: a GIF has its own path in the base class, and a photo upload of one
+        would take the wrong branch."""
+        lowered = str(source or "").lower().split("?")[0]
+        if lowered.endswith(".gif"):
+            return False
+        if lowered.startswith(("http://", "https://")):
+            return True
+        return lowered.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp"))
+
+    async def _read_source_bytes(self, source: str, default_name: str) -> Tuple[bytes, str]:
+        """Read a local file or fetch a URL — the shared half of every attachment send."""
+        if self.client is None:
+            raise RuntimeError("not connected")
+        name = os.path.basename(str(source).split("?")[0]) or default_name
+        if str(source).startswith(("http://", "https://")):
+            return await self.client.download(source), name
+        path = str(source)[7:] if str(source).startswith("file://") else str(source)
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+        with open(path, "rb") as handle:
+            return handle.read(), name
+
+    async def send_multiple_images(self, chat_id: str, images: List[Tuple[str, str]],
+                                   metadata: Optional[Dict[str, Any]] = None,
+                                   human_delay: float = 0.0) -> SendResult:
+        """Bundle static photos into ONE VK message.
+
+        The base implementation sends them one by one; VK's `messages.send` takes a comma-separated
+        `attachment` list, so a gallery arrives as a single bubble with one caption instead of N
+        notifications. Anything that is not a static photo (a GIF, an odd suffix), every image past
+        ``MAX_ALBUM_ATTACHMENTS``, and every image whose upload failed is handed back to
+        ``super().send_multiple_images(...)`` — that path knows how to degrade each kind — so a failed
+        album never silently drops an image. Success follows the base contract: true when at least one
+        image was delivered.
+        """
+        if self.client is None:
+            return SendResult(success=False, error="Not connected")
+        try:
+            peer_id = int(chat_id)
+        except (TypeError, ValueError):
+            return SendResult(success=False, error=f"invalid VK peer id: {chat_id!r}")
+        items: List[Tuple[str, str]] = [(str(u), str(a or "")) for u, a in (images or [])]
+        if not items:
+            return SendResult(success=False, error="no images")
+        bundled: List[str] = []
+        captions: List[str] = []
+        deferred: List[Tuple[str, str]] = list(items[MAX_ALBUM_ATTACHMENTS:])
+        failures: List[str] = []
+        for source, alt in items[:MAX_ALBUM_ATTACHMENTS]:
+            if self._is_animation_url(source) or not self._is_bundleable_photo(source):
+                deferred.append((source, alt))
+                continue
+            try:
+                data, name = await self._read_source_bytes(source, "image.jpg")
+                bundled.append(await self._upload_bytes(data, name, kind="photo", chat_id=chat_id))
+                if alt.strip():
+                    captions.append(alt.strip())
+            except Exception as exc:
+                logger.warning("VK: album upload failed for %s: %s", source, exc)
+                failures.append(f"{alt or source}: {exc}")
+                deferred.append((source, alt))
+        delivered = False
+        message_id = ""
+        if bundled:
+            caption = " · ".join(captions)[: self.MAX_MESSAGE_LENGTH]
+            try:
+                sent = await self.client.send_message(peer_id, caption, attachment=",".join(bundled))
+                delivered = bool(sent)
+                message_id = str(sent or "")
+                logger.info("VK: album of %d photo(s) sent to peer %s (%d deferred)",
+                            len(bundled), peer_id, len(deferred))
+            except Exception as exc:
+                # The uploads are already paid for: deliver them one by one rather than lose the album.
+                logger.warning("VK: album send failed (%s) — sending %d photo(s) one by one", exc, len(bundled))
+                failures.append(str(exc))
+                for attachment in bundled:
+                    try:
+                        sent = await self.client.send_message(peer_id, "", attachment=attachment)
+                        delivered = delivered or bool(sent)
+                        message_id = message_id or str(sent or "")
+                    except Exception as inner:
+                        failures.append(str(inner))
+        if deferred:
+            rest = await super().send_multiple_images(chat_id, deferred, metadata=metadata,
+                                                      human_delay=human_delay)
+            delivered = delivered or bool(getattr(rest, "success", False))
+            message_id = message_id or str(getattr(rest, "message_id", "") or "")
+        if not delivered:
+            return SendResult(success=False, error="; ".join(failures)[:300] or "no image delivered",
+                              error_kind="unknown", retryable=True)
+        return SendResult(success=True, message_id=message_id,
+                          error="; ".join(failures)[:300] if failures else None)
 
     async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None,
                             file_name: Optional[str] = None, reply_to: Optional[str] = None,
