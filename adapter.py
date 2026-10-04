@@ -1219,6 +1219,8 @@ class VKAdapter(BasePlatformAdapter):
             logger.warning("VK: model picker send failed: %s", exc)
             return SendResult(success=False, error=str(exc))
         self.pickers.update(state["id"], message_id=message_id)
+        logger.info("VK: model picker sent to peer %s (%d providers, current=%s)",
+                    peer_id, len(providers or []), current_model or "?")
         return SendResult(success=True, message_id=str(message_id or ""))
 
     async def send_choice_picker(
@@ -1244,6 +1246,7 @@ class VKAdapter(BasePlatformAdapter):
             logger.warning("VK: choice picker send failed: %s", exc)
             return SendResult(success=False, error=str(exc))
         self.pickers.update(state["id"], message_id=message_id)
+        logger.info("VK: choice picker sent to peer %s (%d choices)", peer_id, len(choices or []))
         return SendResult(success=True, message_id=str(message_id or ""))
 
     async def _refresh_picker(self, state: Dict[str, Any], peer_id: int) -> bool:
@@ -1387,6 +1390,8 @@ class VKAdapter(BasePlatformAdapter):
                 body, succeeded = f"Не удалось переключить: {exc}", False
         self.pickers.update(str(state["id"]), resolved=True, succeeded=succeeded, pending_model=model_id)
         await self._finish_picker(state, peer_id, body, succeeded)
+        logger.info("VK: model picker %s chosen model=%s provider=%s ok=%s",
+                    state.get("id"), model_id, provider_slug, succeeded)
         await self._answer_event(event_id, user_id, peer_id, (body.splitlines()[0] or "Готово")[:60])
 
     async def _finish_picker(self, state: Dict[str, Any], peer_id: int, body: str, succeeded: bool) -> None:
