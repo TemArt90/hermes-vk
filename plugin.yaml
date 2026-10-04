@@ -8,6 +8,8 @@ description: >
   no public URL, no domain, no webhook. Works from RF networks without a proxy.
   Ported from the openclaw-vk channel plugin.
 author: Hermes Agent
+provides_tools:
+  - vk_checklist
 requires_env:
   - name: VK_TOKEN
     description: "Ключ доступа сообщества (VK community access token) с правами «Сообщения сообщества» и «Управление сообществом»"
