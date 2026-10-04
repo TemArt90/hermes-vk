@@ -376,15 +376,22 @@ class VkClient:
         )
         return int(response or 0)
 
-    async def edit_message(self, peer_id: int, message_id: int, message: str) -> None:
+    async def edit_message(self, peer_id: int, message_id: int, message: str, *,
+                           keyboard: Optional[str] = None) -> None:
         """Rewrite a message the bot already sent (``messages.edit``).
 
         ``messages.edit`` takes no ``format_data`` parameter, so an edited message is plain text —
         the renderer's markup only ever survives on the original ``messages.send``. It also cannot
         split: content that does not fit one message has to be sent anew by the caller.
+
+        ``keyboard`` **is** accepted (measured live 04.10.2026: the replacement keyboard comes back
+        from ``messages.getById``), which is what lets an interactive widget re-render its ticks in
+        place. Omitting it leaves the keyboard untouched only if VK keeps it, so callers that manage
+        buttons always pass the full keyboard explicitly.
         """
         await self.call(
-            "messages.edit", peer_id=peer_id, message_id=message_id, message=message, timeout=30)
+            "messages.edit", peer_id=peer_id, message_id=message_id, message=message,
+            keyboard=keyboard, timeout=30)
 
     async def send_reaction(self, peer_id: int, cmid: int, reaction_id: int) -> bool:
         """React to a message (``messages.sendReaction``).

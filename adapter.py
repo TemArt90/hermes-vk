@@ -57,6 +57,8 @@ from gateway.platforms.helpers import MessageDeduplicator, cancel_task, compile_
 
 from .vk_api import DEFAULT_API_VERSION, VkApiError, VkClient, redact_secrets
 from .vk_markdown import render_chunks, to_plain
+from .tools import register_tools
+from .widgets import WidgetStore, counts, page_count
 
 logger = logging.getLogger(__name__)
 
@@ -375,6 +377,9 @@ class VKAdapter(BasePlatformAdapter):
         self._approval_state: Dict[str, str] = {}
         self._slash_confirm_state: Dict[str, str] = {}
         self._clarify_state: Dict[str, str] = {}
+        # Interactive widgets (tickable lists). State is on disk because a widget outlives the process,
+        # unlike the short-lived clarify/approval ids above.
+        self.widgets = WidgetStore()
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -812,6 +817,8 @@ class VKAdapter(BasePlatformAdapter):
             await self._resolve_approval(payload, event_id, user_id, peer_id)
         elif action == "sc":
             await self._resolve_slash_confirm(payload, event_id, user_id, peer_id)
+        elif action == "w":
+            await self._resolve_widget(payload, event_id, user_id, peer_id)
         else:
             await self._answer_event(event_id, user_id, peer_id, "Кнопка устарела")
 
@@ -824,6 +831,62 @@ class VKAdapter(BasePlatformAdapter):
             # Never swallow silently: an unanswered press leaves the user's button spinning forever,
             # and without this line that failure is indistinguishable from "the event never arrived".
             logger.warning("VK: could not answer button event %s: %s", event_id, exc)
+
+    async def _resolve_widget(self, payload: Dict[str, Any], event_id: str, user_id: int,
+                              peer_id: int) -> None:
+        """Apply one press on an interactive widget and rewrite its message in place.
+
+        Ownership is checked against the peer the widget was posted to: a payload from another chat
+        (a forwarded message, a stale id) must not move state here. The keyboard is always re-sent
+        with the new text, so a failed edit degrades to a snackbar instead of a half-updated list.
+        """
+        widget_id = str(payload.get("id") or "")
+        action = str(payload.get("a") or "")
+        widget = self.widgets.owned(widget_id, peer_id) if widget_id else None
+        if widget is None:
+            await self._answer_event(event_id, user_id, peer_id, "Список устарел")
+            return
+        snackbar = ""
+        if action == "t":
+            widget, item = self.widgets.toggle(widget_id, str(payload.get("k") or ""))
+            if widget is None or item is None:
+                await self._answer_event(event_id, user_id, peer_id, "Пункт не найден")
+                return
+            done, total = counts(widget)
+            mark = "отмечено" if item.get("d") else "снято"
+            snackbar = f"{item.get('t')} — {mark} · {done}/{total}"
+            if total and done == total:
+                snackbar = f"Всё отмечено ✅ {done}/{total}"
+        elif action == "p":
+            with contextlib.suppress(TypeError, ValueError):
+                widget = self.widgets.bump_page(widget_id, int(payload.get("d") or 1))
+            if widget is None:
+                await self._answer_event(event_id, user_id, peer_id, "Список устарел")
+                return
+            snackbar = f"Стр. {int(widget.get('page') or 0) + 1}/{page_count(widget)}"
+        else:
+            await self._answer_event(event_id, user_id, peer_id, "Кнопка устарела")
+            return
+        assert widget is not None
+        message_id = widget.get("message_id")
+        if message_id and self.client is not None:
+            from .widgets import render
+
+            text, keyboard = render(widget)
+            try:
+                await self.client.edit_message(int(peer_id), int(message_id), text, keyboard=keyboard)
+            except VkApiError as exc:
+                logger.warning("VK: widget %s edit failed (%s): %s", widget_id, exc.code, exc)
+                await self._answer_event(event_id, user_id, peer_id,
+                                         "Не удалось обновить список — пришли новый")
+                return
+            except Exception as exc:
+                logger.warning("VK: widget %s edit failed: %s", widget_id, exc)
+                await self._answer_event(event_id, user_id, peer_id, "Не удалось обновить список")
+                return
+        logger.info("VK: widget %s press action=%s peer=%s item=%s",
+                    widget_id, action, peer_id, payload.get("k") or "-")
+        await self._answer_event(event_id, user_id, peer_id, snackbar or "Готово")
 
     async def _resolve_clarify(self, payload: Dict[str, Any], event_id: str, user_id: int, peer_id: int) -> None:
         clarify_id = str(payload.get("id") or "")
@@ -1391,3 +1454,5 @@ def register(ctx) -> None:
             "your reply quotes the user's message. Buttons (choice prompts, command approvals) arrive as "
             "keyboard taps. Keep answers conversational."),
     )
+    # Interactive widgets: the tool ships with the platform it drives (tools.py + widgets.py).
+    register_tools(ctx)

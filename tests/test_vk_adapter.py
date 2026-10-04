@@ -1191,6 +1191,11 @@ def _registered_platform_kwargs() -> dict:
         def register_platform(self, **kwargs):
             captured.update(kwargs)
 
+        def register_tool(self, **kwargs):
+            # The plugin also registers the widget tool (`vk_checklist`); a ctx without this method
+            # would make the whole register() call fail, so the stub mirrors both halves.
+            captured.setdefault("tools", []).append(kwargs)
+
     register(_Ctx())
     return captured
 
